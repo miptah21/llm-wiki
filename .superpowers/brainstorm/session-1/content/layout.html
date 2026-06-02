@@ -1,0 +1,67 @@
+<h2>Bagaimana Struktur Scrollytelling yang Anda Inginkan?</h2>
+<p class="subtitle">Kami merancang tata letak dua kolom interaktif (Scrollytelling) ala Distill.pub</p>
+
+<div class="mockup" style="margin-bottom: 30px;">
+  <div class="mockup-header">Pratinjau Tata Letak Split-Screen (Scrollytelling)</div>
+  <div class="mockup-body" style="padding: 20px; background: var(--bg-base); min-height: 400px; display: flex; gap: 20px;">
+    <!-- Kolom Kiri: Teks yang Bergulir -->
+    <div style="flex: 1.2; height: 350px; overflow-y: scroll; padding: 15px; background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 8px; font-size: 13px;">
+      <div style="padding-bottom: 20px; border-bottom: 1px dashed var(--border-color); margin-bottom: 15px; background: rgba(2, 132, 199, 0.05);">
+        <span class="badge badge-purple" style="font-size: 9px;">Bagian 1</span>
+        <h4 style="margin: 5px 0;">Many-Shot In-Context Learning</h4>
+        <p style="color: var(--text-muted); font-size: 12px; margin-top: 5px;">
+          Makalah ini mendokumentasikan fenomena Many-Shot ICL di mana ratusan contoh demonstrasi dimasukkan ke dalam prompt. Namun, hal ini memakan memori kontekstual (token) yang luar biasa besar...
+        </p>
+      </div>
+      <div style="padding-bottom: 20px; border-bottom: 1px dashed var(--border-color); margin-bottom: 15px; opacity: 0.7;">
+        <span class="badge badge-purple" style="font-size: 9px;">Bagian 2</span>
+        <h4 style="margin: 5px 0;">Distilasi menjadi Cheat Sheet</h4>
+        <p style="color: var(--text-muted); font-size: 12px; margin-top: 5px;">
+          Solusi: Latih LLM untuk merangkum ratusan contoh tersebut menjadi satu lembar panduan ringkas (Cheat Sheet) tekstual berukuran kecil.
+        </p>
+      </div>
+      <div style="padding-bottom: 20px; opacity: 0.7;">
+        <span class="badge badge-purple" style="font-size: 9px;">Bagian 3</span>
+        <h4 style="margin: 5px 0;">Perbandingan dengan k-NN</h4>
+        <p style="color: var(--text-muted); font-size: 12px; margin-top: 5px;">
+          Dibandingkan k-NN yang membutuhkan test-time retrieval, Cheat Sheet menyimpan aturan global statis yang langsung dibaca oleh LLM tanpa pencarian dinamis.
+        </p>
+      </div>
+    </div>
+
+    <!-- Kolom Kanan: Visualizer Lengket (Sticky) -->
+    <div style="flex: 1; height: 350px; display: flex; flex-direction: column; justify-content: center; align-items: center; background: var(--bg-surface); border: 1px solid var(--border-color); border-radius: 8px; position: relative;">
+      <div style="position: absolute; top: 10px; right: 10px; font-size: 10px; color: var(--text-muted); text-transform: uppercase; font-weight: bold; letter-spacing: 0.5px;">Panel Visualizer 3D/SVG</div>
+      
+      <!-- Visual 3D Mini Demo -->
+      <div style="display: flex; flex-direction: column; align-items: center; gap: 8px;">
+        <!-- Stack blocks representing Many-Shot ICL -->
+        <div style="width: 80px; height: 12px; background: var(--accent-cyan); border-radius: 2px; box-shadow: 0 0 10px rgba(3, 105, 161, 0.4); transform: rotateX(45deg); transition: all 0.5s;"></div>
+        <div style="width: 80px; height: 12px; background: var(--accent-purple); border-radius: 2px; transform: rotateX(45deg); transition: all 0.5s;"></div>
+        <div style="width: 80px; height: 12px; background: var(--accent-coral); border-radius: 2px; transform: rotateX(45deg); transition: all 0.5s;"></div>
+        <p style="font-size: 11px; margin-top: 15px; font-weight: bold; color: var(--text-main); text-align: center;">
+          Visualizer Terikat Scroll<br>
+          <span style="font-size: 10px; color: var(--accent-cyan); font-weight: normal;">(Kubus 3D bertransisi otomatis saat Anda membaca teks di kiri)</span>
+        </p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>Pilih Pendekatan Integrasi Scroll:</h3>
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>(Direkomendasikan) Scroll-Linked Native Intersection Observer</h3>
+      <p>Menggunakan browser Intersection Observer API untuk memantau bagian teks kiri yang aktif dan mentrigger animasi transisi Three.js/SVG di panel kanan tanpa lag atau external libraries.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Interactive Step-by-Step Dashboard (Dual View)</h3>
+      <p>Menggunakan tab samping vertikal statis untuk memicu transisi. User mengklik secara sadar untuk berpindah halaman, bukan melalui scroll otomatis.</p>
+    </div>
+  </div>
+</div>

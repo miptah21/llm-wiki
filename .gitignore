@@ -1,0 +1,5 @@
+.agents/
+/docs/
+AGENTS.md
+/wiki/.search_index.db
+*.pdf
