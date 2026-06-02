@@ -1,4 +1,5 @@
 .agents/
+.superpowers/
 /docs/
 AGENTS.md
 /wiki/.search_index.db
