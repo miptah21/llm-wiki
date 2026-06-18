@@ -1,6 +1,79 @@
-.agents/
+# Runtime/session artifacts
 .superpowers/
-/docs/
-AGENTS.md
+scratch/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+audit_report.md
+scripts/audit_report.md
+test_fig_1.png
+
+# Generated local cache
 /wiki/.search_index.db
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+
+# Testing, Linting & QA caches
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.log
+
+# Environment variables (prevents API key leaks)
+.env
+.env.local
+.env.*.local
+*.env
+.direnv/
+
+# IDE / Editor configurations
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# OS metadata
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+
+# Obsidian user-session / workspace state (avoids merge conflicts on workspace files)
+.obsidian/workspace.json
+.obsidian/workspace
+.obsidian/backups/
+
+# Raw materials (ignore user-ingested documents, keep directory structure via .gitkeep)
+raw/articles/*
+!raw/articles/.gitkeep
+raw/notes/*
+!raw/notes/.gitkeep
+raw/papers/*
+!raw/papers/.gitkeep
+
+# Fallback block for PDF files
 *.pdf
+
+# Compiled wiki directories and logs (ignores personal notes while keeping template files intact)
+wiki/en/**
+wiki/id/**
+wiki/raw_sources/**
+wiki/assets/**
+wiki/log.md

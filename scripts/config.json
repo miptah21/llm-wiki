@@ -1,0 +1,25 @@
+{
+  "valid_domains": ["finance", "software-engineering", "ai", "economics", "education", "personal-development", "mathematics", "language-learning"],
+  "domains_map_en": {
+    "finance": "📈 Finance",
+    "software-engineering": "💻 Software Engineering",
+    "ai": "🧠 Artificial Intelligence",
+    "economics": "🏛️ Economics",
+    "education": "🎓 Education",
+    "personal-development": "🌱 Personal Development",
+    "mathematics": "🧮 Mathematics",
+    "language-learning": "🗣️ Language Learning",
+    "other": "General / Uncategorized"
+  },
+  "domains_map_id": {
+    "finance": "📈 Keuangan",
+    "software-engineering": "💻 Rekayasa Perangkat Lunak",
+    "ai": "🧠 Kecerdasan Buatan",
+    "economics": "🏛️ Ekonomi",
+    "education": "🎓 Pendidikan",
+    "personal-development": "🌱 Pengembangan Diri",
+    "mathematics": "🧮 Matematika",
+    "language-learning": "🗣️ Pembelajaran Bahasa",
+    "other": "Umum / Tanpa Kategori"
+  }
+}

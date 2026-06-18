@@ -208,8 +208,14 @@ def stem_text(text, lang_code):
             stemmed_words.append(stem_english_refined(w))
     return " ".join(sorted(list(set(stemmed_words))))
 
-def format_fts5_query_bilingual(query_text):
-    """Format search query for SQLite FTS5 matching, combining EN and ID stemming with prefix wildcards."""
+def format_fts5_query_bilingual(query_text, operator="AND"):
+    """Format search query for SQLite FTS5 matching, combining EN and ID stemming with prefix wildcards.
+    
+    Args:
+        query_text: The raw search query string.
+        operator: Join logic between term groups. "AND" (strict, all terms must match)
+                  or "OR" (relaxed, any term can match). Default is "AND".
+    """
     words = re.findall(r"\b\w+\b", query_text.lower())
     query_parts = []
     for w in words:
@@ -228,4 +234,5 @@ def format_fts5_query_bilingual(query_text):
         
     if not query_parts:
         return ""
-    return " AND ".join(query_parts)
+    joiner = f" {operator.upper()} "
+    return joiner.join(query_parts)

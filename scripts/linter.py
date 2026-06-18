@@ -2,16 +2,11 @@ import os
 import re
 import sys
 
-# Windows Encoding Safeguard for non-ASCII characters / emojis
-if sys.platform.startswith("win"):
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 # Directory Paths
 WIKI_DIR = "wiki"
 
-from parser import parse_yaml_frontmatter
+from parser import parse_yaml_frontmatter, YAML_PATTERN
 
 # Regex patterns
 WIKILINK_PATTERN = re.compile(r"\[\[(.*?)\]\]")
@@ -71,8 +66,8 @@ def lint_vault():
         page_type = page_type.lower()
         
         if pagename.lower() not in exclusions:
-            # Sources only need type, created, updated
-            if page_type == "source" or "sources" in filepath:
+            # Sources and source-subpages only need type, created, updated
+            if page_type == "source" or page_type == "source-subpage" or "sources" in filepath:
                 required_keys = {"type", "created", "updated"}
             else:
                 required_keys = {"type", "domain", "lang", "created", "updated"}
@@ -80,18 +75,56 @@ def lint_vault():
             missing = required_keys - set(metadata.keys())
             if missing:
                 schema_failures[filepath] = f"Missing YAML keys: {', '.join(missing)}"
-            elif page_type not in {"concept", "entity", "source"}:
-                schema_failures[filepath] = f"Invalid type '{page_type}' (must be concept, entity, or source)"
+            elif page_type not in {"concept", "entity", "source", "source-subpage"}:
+                schema_failures[filepath] = f"Invalid type '{page_type}' (must be concept, entity, source, or source-subpage)"
             
             # Domain and Lang checks
             if not missing and page_type in {"concept", "entity"}:
-                valid_domains = {"finance", "software-engineering", "ai", "economics"}
+                valid_domains = {"finance", "software-engineering", "ai", "economics", "education", "personal-development", "mathematics", "language-learning"}
+                try:
+                    import json
+                    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+                    if os.path.exists(config_path):
+                        with open(config_path, "r", encoding="utf-8") as cf:
+                            cfg = json.load(cf)
+                            valid_domains = set(cfg.get("valid_domains", []))
+                except Exception:
+                    pass
                 valid_langs = {"en", "id"}
                 
                 if metadata.get("domain") not in valid_domains:
                     schema_failures[filepath] = f"Invalid domain '{metadata.get('domain')}'"
                 elif metadata.get("lang") not in valid_langs:
                     schema_failures[filepath] = f"Invalid language '{metadata.get('lang')}'"
+                else:
+                    # Domain-Path Consistency Check
+                    norm_path = filepath.replace("\\", "/")
+                    parts = norm_path.split("/")
+                    if len(parts) >= 3 and parts[-3] in {"concepts", "entities"}:
+                        expected_domain = parts[-2].lower()
+                        actual_domain = str(metadata.get("domain", "")).lower()
+                        if actual_domain != expected_domain:
+                            schema_failures[filepath] = f"Domain path mismatch: Frontmatter domain is '{actual_domain}', but file is located under '{expected_domain}' directory."
+
+                # Frontmatter Relations target and type checks
+                relations = metadata.get("relations", [])
+                if isinstance(relations, list):
+                    for idx, rel in enumerate(relations):
+                        if isinstance(rel, dict):
+                            target = rel.get("target", "")
+                            rel_type = rel.get("type", "")
+                            
+                            target_clean = target.replace("[[", "").replace("]]", "").strip()
+                            target_lower = target_clean.lower().replace(" ", "-")
+                            
+                            if not target_clean:
+                                schema_failures[filepath] = f"Relation at index {idx} has an empty target."
+                            elif target_lower not in valid_pages:
+                                schema_failures[filepath] = f"Relation at index {idx} points to non-existent target page: [[{target_clean}]]."
+                            else:
+                                valid_relation_types = {"supports", "supported_by", "contradicts", "contradicted_by", "contrasting", "extends", "extended_by"}
+                                if rel_type not in valid_relation_types:
+                                    schema_failures[filepath] = f"Relation to [[{target_clean}]] has an invalid type: '{rel_type}'."
 
             # 1.1 LaTeX Math Formula Subscript Validation (Indonesian Content Integrity Guardrail)
             if metadata.get("lang", "").lower() == "id":
@@ -152,6 +185,10 @@ def lint_vault():
             if link_lower.startswith("http") or link_lower.startswith("www"):
                 continue
                 
+            # Skip media and asset files (e.g. embedded figures)
+            if any(link_lower.endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".gif", ".svg", ".pdf"]):
+                continue
+                
             link_kebab = link_lower.replace(" ", "-")
             if link_lower in valid_pages:
                 matched_key = link_lower
@@ -171,17 +208,24 @@ def lint_vault():
         # 4. Cross-Language Link Contamination Check
         # ID files should link to ID pages (except translation field, which correctly points to EN)
         page_lang = metadata.get("lang", "").lower()
-        if page_lang == "id":
+        if not page_lang:
+            norm_filepath = filepath.replace("\\", "/")
+            if "/id/" in norm_filepath:
+                page_lang = "id"
+            elif "/en/" in norm_filepath:
+                page_lang = "en"
+        if page_lang == "id" and pagename.lower() not in {"index", "log"}:
             # Get the translation target so we can exclude it from the check
             trans_target = metadata.get("translation", "").replace("[[", "").replace("]]", "").strip().lower()
             # Also exclude source links (sources are referenced by convention)
             source_refs = [s.replace("[[", "").replace("]]", "").strip().lower() for s in metadata.get("sources", [])]
             
-            body_content = content
             # Strip frontmatter from body to avoid false positives on translation/sources fields
-            fm_end = content.find("---", content.find("---") + 3)
-            if fm_end != -1:
-                body_content = content[fm_end + 3:]
+            match = YAML_PATTERN.match(content)
+            if match:
+                body_content = content[match.end():]
+            else:
+                body_content = content
             
             body_links = WIKILINK_PATTERN.findall(body_content)
             for link in body_links:
@@ -285,4 +329,9 @@ def lint_vault():
 
 if __name__ == "__main__":
     import sys
+    # Windows Encoding Safeguard for non-ASCII characters / emojis
+    if sys.platform.startswith("win"):
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
     sys.exit(lint_vault())

@@ -3,18 +3,13 @@ import re
 import sys
 import sqlite3
 
-# Windows Encoding Safeguard for non-ASCII characters / emojis
-if sys.platform.startswith("win"):
-    import io
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 # Directory Paths
 WIKI_DIR = "wiki"
 EN_DIR = os.path.join(WIKI_DIR, "en")
 ID_DIR = os.path.join(WIKI_DIR, "id")
 
-from parser import parse_yaml_frontmatter, detect_page_attributes
+from parser import parse_yaml_frontmatter, detect_page_attributes, YAML_PATTERN
 from stemmer import stem_text
 
 # Map domains to English formatted titles
@@ -34,6 +29,20 @@ DOMAINS_MAP_ID = {
     "economics": "🏛️ Ekonomi",
     "other": "📂 Umum / Tanpa Kategori"
 }
+
+# Attempt to load visual maps dynamically from config.json
+try:
+    import json
+    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as cf:
+            cfg = json.load(cf)
+            if "domains_map_en" in cfg:
+                DOMAINS_MAP_EN = cfg["domains_map_en"]
+            if "domains_map_id" in cfg:
+                DOMAINS_MAP_ID = cfg["domains_map_id"]
+except Exception:
+    pass
 
 def scan_lang_vault(lang_dir, lang_code):
     """
@@ -88,7 +97,7 @@ def scan_lang_vault(lang_dir, lang_code):
                         page_type = page_type[0] if page_type else "concept"
                     page_type = page_type.lower()
                     
-                    if page_type == "source" or dir_type == "sources":
+                    if page_type == "source" or page_type == "source-subpage" or dir_type == "sources":
                         sources.append(metadata)
                     elif page_type == "entity" or dir_type == "entities":
                         entities.append(metadata)
@@ -123,6 +132,8 @@ def build_localized_index(lang_code, lang_dir, DOMAINS_MAP, is_en=True):
             output.append("| :--- | :--- | :--- | :--- |")
             sorted_sources = sorted(sources, key=lambda x: x.get("updated", x.get("created", "")), reverse=True)
             for s in sorted_sources:
+                if s.get("type") == "source-subpage" or "parent" in s:
+                    continue
                 name = s["_name"].replace("source-", "").replace("-", " ").title()
                 link = f"[[{s['_name']}]]"
                 raw_file = s.get("source_file", "Unknown")
@@ -150,6 +161,8 @@ def build_localized_index(lang_code, lang_dir, DOMAINS_MAP, is_en=True):
             output.append("| :--- | :--- | :--- | :--- |")
             sorted_sources = sorted(sources, key=lambda x: x.get("updated", x.get("created", "")), reverse=True)
             for s in sorted_sources:
+                if s.get("type") == "source-subpage" or "parent" in s:
+                    continue
                 name = s["_name"].replace("source-", "").replace("-", " ").title()
                 link = f"[[{s['_name']}]]"
                 raw_file = s.get("source_file", "Unknown")
@@ -281,16 +294,13 @@ def build_localized_index(lang_code, lang_dir, DOMAINS_MAP, is_en=True):
 DB_PATH = os.path.join(WIKI_DIR, ".search_index.db")
 
 def build_sqlite_index(pages):
-    # Remove existing database file if it exists to ensure a clean build
-    if os.path.exists(DB_PATH):
-        try:
-            os.remove(DB_PATH)
-        except Exception as e:
-            print(f"Warning: Failed to remove old search index database: {e}")
-            
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
+        
+        # Drop and Re-create FTS5 table without destroying other metadata cache tables
+        cursor.execute("DROP TABLE IF EXISTS search_index;")
         
         # Create FTS5 virtual table
         cursor.execute("""
@@ -309,9 +319,24 @@ def build_sqlite_index(pages):
             );
         """)
         
+        # Create metadata table if it does not exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS wiki_metadata (
+                path TEXT PRIMARY KEY,
+                name TEXT,
+                lang TEXT,
+                type TEXT,
+                title TEXT,
+                sha256 TEXT,
+                translation TEXT
+            );
+        """)
+        cursor.execute("DELETE FROM wiki_metadata;")
+        
         insert_data = []
+        insert_meta = []
         for p in pages:
-            filepath = p.get("_path", "")
+            filepath = p.get("_path", "").replace("\\", "/")
             if not filepath or not os.path.exists(filepath):
                 continue
                 
@@ -323,12 +348,17 @@ def build_sqlite_index(pages):
                 continue
                 
             # Extract body content (strip frontmatter)
-            body = full_content
-            if full_content.startswith("---"):
-                parts = full_content.split("---", 2)
-                if len(parts) >= 3:
-                    body = parts[2].strip()
+            sha256_val = None
+            match = YAML_PATTERN.match(full_content)
+            if match:
+                body = full_content[match.end():].strip()
+            else:
+                body = full_content.strip()
                     
+            metadata = parse_yaml_frontmatter(full_content)
+            if metadata and "sha256" in metadata:
+                sha256_val = metadata["sha256"]
+                
             name = p.get("_name", "")
             lang = p.get("lang", "")
             page_type = p.get("_db_type", "concept")
@@ -357,19 +387,36 @@ def build_sqlite_index(pages):
                 stemmed_tokens
             ))
             
+            insert_meta.append((
+                filepath,
+                name,
+                lang,
+                page_type,
+                title,
+                sha256_val,
+                translation
+            ))
+            
         cursor.executemany("""
             INSERT INTO search_index(path, name, lang, type, domain, title, description, content, translation, stemmed_tokens)
             VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
         """, insert_data)
         
+        cursor.executemany("""
+            INSERT OR REPLACE INTO wiki_metadata(path, name, lang, type, title, sha256, translation)
+            VALUES(?, ?, ?, ?, ?, ?, ?);
+        """, insert_meta)
+        
         conn.commit()
         # Optimize FTS5 table
         cursor.execute("INSERT INTO search_index(search_index) VALUES('optimize');")
         conn.commit()
-        conn.close()
-        print(f"Success: Indexed {len(insert_data)} pages in SQLite FTS5 database.")
+        print(f"Success: Indexed {len(insert_data)} pages in SQLite FTS5 database and populated wiki_metadata.")
     except Exception as e:
         print(f"Error: Failed to build SQLite search index database: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def build_index():
     print("Running domain-aware bilingual indexing pass...")
@@ -392,10 +439,15 @@ def build_index():
             p["_db_type"] = "entity"
             all_pages.append(p)
         for p in sources:
-            p["_db_type"] = "source"
+            p["_db_type"] = p.get("type", "source")
             all_pages.append(p)
             
     build_sqlite_index(all_pages)
 
 if __name__ == "__main__":
+    # Windows Encoding Safeguard for non-ASCII characters / emojis
+    if sys.platform.startswith("win"):
+        import io
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
     build_index()

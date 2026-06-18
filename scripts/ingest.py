@@ -1,7 +1,10 @@
 import os
 import sys
+import re
+from datetime import datetime
+from typing import Optional, List, Dict, Any
 
-# Windows encoding safeguard for emoji output
+# Windows encoding safeguard for emoji output (at module load time)
 if sys.platform.startswith("win"):
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -11,507 +14,219 @@ if sys.platform.startswith("win"):
         sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-import json
-import hashlib
-import re
-from datetime import datetime
-import subprocess
-
-# Add scripts directory to path to import local modules
+# Add scripts directory to path to import local package
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from parser import parse_yaml_frontmatter, detect_page_attributes
+from ingest.persistence import (
+    validate_safe_path,
+    project_relative_path,
+    calculate_sha256,
+    check_duplicate,
+    write_wiki_page,
+    merge_or_write_page
+)
+from ingest.extractor import (
+    parallel_pdf_ingest,
+    extract_pdf_tables,
+    extract_pdf_images
+)
+from ingest.llm_pipeline import (
+    process_deepseek,
+    run_groundedness_evaluation
+)
+from ingest.local_fallback import process_offline
+from ingest.conflict_detector import detect_cross_references, read_concept_pages
+from ingest.wikilinks import (
+    scan_vault_pages_db,
+    build_link_map,
+    normalize_wikilinks
+)
 
-# Paths
 WIKI_DIR = "wiki"
 EN_DIR = os.path.join(WIKI_DIR, "en")
 ID_DIR = os.path.join(WIKI_DIR, "id")
 LOG_PATH = os.path.join(WIKI_DIR, "log.md")
-
-def chunk_text(text, max_chars=15000, overlap=1500):
-    chunks = []
-    start = 0
-    text_len = len(text)
-    while start < text_len:
-        end = start + max_chars
-        if end >= text_len:
-            chunks.append(text[start:])
-            break
-        chunk_slice = text[start:end]
-        last_double_newline = chunk_slice.rfind("\n\n")
-        if last_double_newline > max_chars * 0.75:
-            end_point = start + last_double_newline
-        else:
-            last_newline = chunk_slice.rfind("\n")
-            if last_newline > max_chars * 0.75:
-                end_point = start + last_newline
-            else:
-                end_point = end
-        chunks.append(text[start:end_point])
-        start = end_point - overlap
-    return chunks
-
-def _ocr_page_worker(pdf_path, page_num, tessdata_path, lang):
-    import fitz
-    import os
-    try:
-        doc = fitz.open(pdf_path)
-        page = doc[page_num]
-        text = page.get_text()
-        if len(text.strip()) >= 50:
-            return page_num, text
-        if tessdata_path and os.path.exists(tessdata_path):
-            tp = page.get_textpage_ocr(language=lang, tessdata=tessdata_path)
-            ocr_text = page.get_text(textpage=tp)
-            return page_num, ocr_text
-        return page_num, "[Halaman Terpindai - OCR Tidak Dikonfigurasi]"
-    except Exception as e:
-        return page_num, f"[Error Halaman {page_num}: {e}]"
-
-def parallel_pdf_ingest(pdf_path, tessdata_path=None, lang="eng+ind+equ", max_workers=4):
-    import fitz
-    from concurrent.futures import ProcessPoolExecutor, as_completed
-    doc = fitz.open(pdf_path)
-    total_pages = len(doc)
-    doc.close()
-    
-    results = {}
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_ocr_page_worker, pdf_path, page_num, tessdata_path, lang): page_num
-            for page_num in range(total_pages)
-        }
-        for future in as_completed(futures):
-            page_num = futures[future]
-            try:
-                p_num, extracted_text = future.result()
-                results[p_num] = extracted_text
-            except Exception as exc:
-                results[page_num] = f"[Process failed for page {page_num}: {exc}]"
-                
-    full_ordered_text = [results[i] for i in range(total_pages)]
-    return "\n\n".join(full_ordered_text)
-
-def calculate_sha256(filepath):
-    """Calculates the SHA-256 checksum of a file."""
-    sha256_hash = hashlib.sha256()
-    with open(filepath, "rb") as f:
-        for byte_block in iter(lambda: f.read(4096), b""):
-            sha256_hash.update(byte_block)
-    return sha256_hash.hexdigest()
-
-def check_duplicate(checksum, source_filename):
-    """Checks if a source with the same checksum already exists in the vault.
-    If the content checksum matches, it's a duplicate.
-    If only the filename matches but the checksum differs, it's an update, not a duplicate.
+def resolve_translation_target(target_name: str, target_lang: str) -> str:
+    """Resolves the actual translation page name from the SQLite metadata database if it exists,
+    otherwise falls back to f'{target_name}-id' (or stripping '-id' if target_lang is 'en').
     """
-    for root, _, files in os.walk(WIKI_DIR):
-        for file in files:
-            if not file.endswith(".md"):
-                continue
-            filepath = os.path.join(root, file)
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                metadata = parse_yaml_frontmatter(content)
-                if metadata.get("type") == "source":
-                    if metadata.get("sha256") == checksum:
-                        return filepath
-            except Exception:
-                continue
-    return None
-
-def extract_sections(content):
-    """Heuristically splits a markdown document into chapters or sections by headers."""
-    sections = []
-    # Split by h1 or h2
-    pattern = re.compile(r"^(#+|##+)\s+(.*?)$", re.MULTILINE)
-    matches = list(pattern.finditer(content))
-    
-    if not matches:
-        return [{"title": "General", "content": content}]
+    import sqlite3
+    db_path = os.path.join(WIKI_DIR, ".search_index.db")
+    if not os.path.exists(db_path):
+        return f"{target_name}-id" if target_lang == "id" else target_name.replace("-id", "")
         
-    for i, match in enumerate(matches):
-        start = match.end()
-        end = matches[i+1].start() if i + 1 < len(matches) else len(content)
-        title = match.group(2).strip()
-        sec_content = content[start:end].strip()
-        sections.append({
-            "title": title,
-            "content": sec_content
-        })
-    return sections
-
-def extract_and_parse_json(response_text):
-    """Robustly extracts JSON from LLM response text and parses it, repairing common truncation errors if needed."""
-    start_idx = response_text.find("{")
-    if start_idx == -1:
-        return None
-        
-    candidate_json = response_text[start_idx:].strip()
-    
-    # Strip markdown code fences if they are at the end
-    if candidate_json.endswith("```"):
-        candidate_json = candidate_json[:-3].strip()
-        
-    # Try parsing directly
+    conn = None
     try:
-        return json.loads(candidate_json)
-    except json.JSONDecodeError:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        lookup_lang = "en" if target_lang == "id" else "id"
+        cursor.execute("SELECT translation FROM wiki_metadata WHERE name = ? AND lang = ?;", (target_name, lookup_lang))
+        row = cursor.fetchone()
+        if row and row[0] and row[0].strip().lower() != "none" and row[0].strip():
+            return row[0].strip()
+    except Exception:
         pass
-        
-    # If parsing failed, it might be truncated. Try to find the last closing brace or bracket
-    # and try to repair it by appending closing characters
-    for i in range(len(candidate_json), 0, -1):
-        if candidate_json[i-1] in ("}", "]", '"'):
-            truncated_part = candidate_json[:i]
-            # Try appending closing symbols
-            for suffix in ["", "}", " ] }", " } ] }", " }", '"}', '" ] }', '" } ] }']:
-                try:
-                    return json.loads(truncated_part + suffix)
-                except json.JSONDecodeError:
-                    continue
-    return None
-
-def merge_contents_with_llm(name, text_type, content_list, anchor_quotes):
-    from deepseek_helper import call_deepseek
-    import os
-    combined_raw = "\n---\n".join(content_list)
-    combined_anchors = "\n".join([f"- \"{q}\"" for q in anchor_quotes if q])
-    
-    prompt = (
-        f"You are a professional technical editor. Merge these raw explanations of the {text_type} '{name}' "
-        f"into a single cohesive markdown explanation. Do not repeat facts, keep all technical nuances, "
-        f"and preserve LaTeX math formulas exactly.\n\n"
-        f"Verbatim Anchor Quotes to respect/anchor to:\n{combined_anchors}\n\n"
-        f"Raw Content Blocks:\n{combined_raw}"
-    )
-    try:
-        return call_deepseek(prompt, "You are a professional technical writer. Synthesize the text.")
-    except Exception as e:
-        print(f"Warning: Failed to call LLM for merging '{name}': {e}. Using raw concatenation.")
-        return "\n\n".join(content_list)
-
-def process_deepseek(raw_content, filename, version="1.0.0"):
-    """Calls DeepSeek API if online to perform map-reduce chunk processing."""
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
-    if not api_key:
-        return None
-        
-    try:
-        from deepseek_helper import call_deepseek
-        chunks = chunk_text(raw_content)
-        print(f"Connected to DeepSeek API. Divided document into {len(chunks)} chunks. Processing Map phase...")
-        
-        intermediate_data = []
-        system_prompt = (
-            "You are an expert bilingual scientific data ingestion engine. "
-            "Your task is to summarize the raw scientific asset in both English and Indonesian. "
-            "You must return a valid JSON object with the following structure (do not return any markdown formatting outside of JSON):\n"
-            "CRITICAL WIKILINK RULE: All wikilinks in content fields MUST use kebab-case matching the concept/entity 'name' field. "
-            "For content_en use [[concept-kebab-name]], for content_id use [[concept-kebab-name-id]]. "
-            "NEVER use Title Case in wikilinks like [[Some Concept Name]].\n"
-            "{\n"
-            "  \"title_en\": \"English Title\",\n"
-            "  \"title_id\": \"Indonesian Title\",\n"
-            "  \"summary_en\": \"Comprehensive English summary\",\n"
-            "  \"summary_id\": \"Comprehensive Indonesian summary (keeping LaTeX formulas and scientific terms original/natural)\",\n"
-            "  \"concepts\": [\n"
-            "    {\n"
-            "      \"name\": \"concept-kebab-name\",\n"
-            "      \"title_en\": \"Concept English Title\",\n"
-            "      \"title_id\": \"Concept Indonesian Title\",\n"
-            "      \"domain\": \"ai/finance/economics/software-engineering\",\n"
-            "      \"tags\": [\"tag1\", \"tag2\"],\n"
-            "      \"description_en\": \"English short description\",\n"
-            "      \"description_id\": \"Indonesian short description\",\n"
-            "      \"content_en\": \"Full markdown content in English. Wikilinks MUST be kebab-case e.g. [[other-concept]]\",\n"
-            "      \"content_id\": \"Full markdown content in Indonesian (keep LaTeX subscripts original). Wikilinks MUST use -id suffix e.g. [[other-concept-id]]\",\n"
-            "      \"anchor_quotes\": [\"exact sentence or formula from the text\", \"another exact quote containing nuances\"]\n"
-            "    }\n"
-            "  ],\n"
-            "  \"entities\": [\n"
-            "    {\n"
-            "      \"name\": \"entity-kebab-name\",\n"
-            "      \"title_en\": \"Entity English Name\",\n"
-            "      \"title_id\": \"Entity Indonesian Name\",\n"
-            "      \"category\": \"person/organization/model/tool/book/other\",\n"
-            "      \"domain\": \"ai/finance/economics/software-engineering\",\n"
-            "      \"tags\": [\"tag1\"],\n"
-            "      \"content_en\": \"Description in English. Wikilinks MUST be kebab-case e.g. [[other-entity]]\",\n"
-            "      \"content_id\": \"Description in Indonesian. Wikilinks MUST use -id suffix e.g. [[other-entity-id]]\",\n"
-            "      \"anchor_quotes\": [\"exact sentence or quote\"]\n"
-            "    }\n"
-            "  ]\n"
-            "}"
-        )
-        
-        # Process chunks sequentially to respect rate limits
-        for idx, chunk in enumerate(chunks):
-            print(f"  Mapping chunk {idx+1}/{len(chunks)}...")
-            prompt = f"Here is the content of chunk {idx+1} from '{filename}':\n\n{chunk}"
-            try:
-                res = call_deepseek(prompt, system_prompt)
-                parsed = extract_and_parse_json(res)
-                if parsed:
-                    intermediate_data.append(parsed)
-            except Exception as e:
-                print(f"  Error mapping chunk {idx+1}: {e}")
-                
-        if not intermediate_data:
-            return None
+    finally:
+        if conn:
+            conn.close()
             
-        print("Processing Reduce phase...")
-        # Merge extracted summaries
-        combined_sum_en = "\n\n".join([d.get("summary_en", "") for d in intermediate_data if d.get("summary_en")])
-        combined_sum_id = "\n\n".join([d.get("summary_id", "") for d in intermediate_data if d.get("summary_id")])
-        
-        # Synthesize final summary
-        reduce_prompt_en = f"Synthesize a cohesive, structured English summary from these chunk summaries:\n\n{combined_sum_en}"
-        reduce_prompt_id = f"Synthesize a cohesive, structured Indonesian summary (keep LaTeX formulas/terms natural) from these chunk summaries:\n\n{combined_sum_id}"
-        
-        final_summary_en = call_deepseek(reduce_prompt_en, "You are a professional technical editor. Summarize the text.")
-        final_summary_id = call_deepseek(reduce_prompt_id, "You are a professional Indonesian technical editor. Summarize the text.")
-        
-        # Deduplicate Concepts and Entities by Name using LLM Merge
-        concepts_map = {}
-        entities_map = {}
-        for d in intermediate_data:
-            for c in d.get("concepts", []):
-                name = c.get("name")
-                if name:
-                    if name not in concepts_map:
-                        concepts_map[name] = {
-                            "meta": c.copy(),
-                            "contents": [c.get("content_en") or c.get("description_en") or ""],
-                            "contents_id": [c.get("content_id") or c.get("description_id") or ""],
-                            "anchors": c.get("anchor_quotes", []) or []
-                        }
-                    else:
-                        concepts_map[name]["contents"].append(c.get("content_en") or c.get("description_en") or "")
-                        concepts_map[name]["contents_id"].append(c.get("content_id") or c.get("description_id") or "")
-                        concepts_map[name]["anchors"].extend(c.get("anchor_quotes", []) or [])
-                        
-            for e in d.get("entities", []):
-                name = e.get("name")
-                if name:
-                    if name not in entities_map:
-                        entities_map[name] = {
-                            "meta": e.copy(),
-                            "contents": [e.get("content_en") or e.get("description_en") or ""],
-                            "contents_id": [e.get("content_id") or e.get("description_id") or ""],
-                            "anchors": e.get("anchor_quotes", []) or []
-                        }
-                    else:
-                        entities_map[name]["contents"].append(e.get("content_en") or e.get("description_en") or "")
-                        entities_map[name]["contents_id"].append(e.get("content_id") or e.get("description_id") or "")
-                        entities_map[name]["anchors"].extend(e.get("anchor_quotes", []) or [])
-                        
-        final_concepts = []
-        for name, data in concepts_map.items():
-            c = data["meta"]
-            c["version"] = c.get("version") or version
-            c["status"] = c.get("status") or "active"
-            if len(data["contents"]) > 1:
-                print(f"  Running smart LLM merge for concept: {name}")
-                c["content_en"] = merge_contents_with_llm(name, "concept", data["contents"], data["anchors"])
-                c["content_id"] = merge_contents_with_llm(name, "concept", data["contents_id"], data["anchors"])
-            else:
-                c["content_en"] = data["contents"][0]
-                c["content_id"] = data["contents_id"][0]
-            c["anchor_quotes"] = list(set(data["anchors"]))
-            final_concepts.append(c)
-            
-        final_entities = []
-        for name, data in entities_map.items():
-            e = data["meta"]
-            e["version"] = e.get("version") or version
-            e["status"] = e.get("status") or "active"
-            if len(data["contents"]) > 1:
-                print(f"  Running smart LLM merge for entity: {name}")
-                e["content_en"] = merge_contents_with_llm(name, "entity", data["contents"], data["anchors"])
-                e["content_id"] = merge_contents_with_llm(name, "entity", data["contents_id"], data["anchors"])
-            else:
-                e["content_en"] = data["contents"][0]
-                e["content_id"] = data["contents_id"][0]
-            e["anchor_quotes"] = list(set(data["anchors"]))
-            final_entities.append(e)
+    return f"{target_name}-id" if target_lang == "id" else target_name.replace("-id", "")
 
-        return {
-            "title_en": intermediate_data[0].get("title_en", filename),
-            "title_id": intermediate_data[0].get("title_id", filename),
-            "summary_en": final_summary_en,
-            "summary_id": final_summary_id,
-            "concepts": final_concepts,
-            "entities": final_entities
-        }
-        
-    except Exception as e:
-        print(f"DeepSeek compilation failed: {e}. Falling back to deterministic local compilation...")
-    return None
 
-def run_groundedness_evaluation(raw_text, synthesized_content, doc_name):
-    from deepseek_helper import call_deepseek
-    import os
-    prompt = (
-        f"You are a critical quality auditor. Compare the synthesized summary of '{doc_name}' with the raw text chunks.\n"
-        f"Determine if any critical qualifying clauses, conditions, or formulas present in the raw text were lost or misstated "
-        f"in the synthesized content.\n\n"
-        f"Raw Chunks (first 5000 chars):\n{raw_text[:5000]}\n\n"
-        f"Synthesized Content:\n{synthesized_content[:3000]}\n\n"
-        f"If anything critical is missing, list the specific gaps. Otherwise, respond exactly with: 'APPROVED'."
-    )
+def resolve_canonical_en_name(name: str) -> str:
+    """Resolves any concept name (English or Indonesian) to its canonical English name using SQLite metadata."""
+    import sqlite3
+    db_path = os.path.join(WIKI_DIR, ".search_index.db")
+    if not os.path.exists(db_path):
+        return name
+        
+    conn = None
     try:
-        evaluation = call_deepseek(prompt, "You are a precise quality control auditor.")
-        print(f"Groundedness check result: {evaluation}")
-        return evaluation
-    except Exception as e:
-        print(f"Warning: Groundedness evaluation skipped due to API error: {e}")
-        return "APPROVED"
-
-def process_offline(raw_content, filename_base, version="1.0.0"):
-    """Deterministic local fallback compiler that acts as the Map-Reduce offline processing pipeline."""
-    print("DeepSeek API is offline or not configured. Running Local Fallback Pipeline...")
-    
-    # If the content contains markdown headers, extract sections.
-    # Otherwise, chunk the text into pseudo-sections to avoid massive summaries.
-    if "# " in raw_content or "## " in raw_content:
-        sections = extract_sections(raw_content)
-    else:
-        chunks = chunk_text(raw_content, max_chars=8000, overlap=500)
-        sections = [{"title": f"Section {idx+1}", "content": chunk} for idx, chunk in enumerate(chunks)]
-    
-    # 1. Base Title
-    title_words = filename_base.replace("-", " ").replace("_", " ").title()
-    title_en = title_words
-    title_id = f"Kompilasi: {title_words}"
-    
-    # 2. Heuristic summarization
-    summary_parts_en = []
-    summary_parts_id = []
-    
-    concepts = []
-    entities = []
-    
-    lower_content = raw_content.lower()
-    
-    # Truncate detail content to prevent massive files in local fallback
-    raw_snippet = raw_content[:2000] + "\n\n...(truncated, full text in raw sources)..." if len(raw_content) > 2000 else raw_content
-    
-    # No hardcoded paper overrides; fallback to generic extraction or basic tests
-    if "distil" in lower_content:
-        # Generate a beautiful concept for Distillation
-        concepts.append({
-            "name": "distilasi-kompresi",
-            "title_en": "Distillation Compression",
-            "title_id": "Distilasi Kompresi",
-            "domain": "ai",
-            "tags": ["distilasi", "efficiency", "compression"],
-            "description_en": "Model compression technique to transfer dark knowledge from a teacher model to a student model.",
-            "description_id": "Teknik kompresi model untuk mentransfer dark knowledge dari model teacher ke model student.",
-            "content_en": (
-                "## Core Architecture\n\n"
-                "**Distillation Compression** is a methodology for training compact models. "
-                "The student model learns to approximate the full logits probability distribution of a larger teacher model.\n\n"
-                "### Objective Function\n"
-                "The distillation loss uses cross-entropy combined with Kullback-Leibler (KL) divergence with temperature $T$:\n"
-                "$$p_i = \\frac{\\exp(z_i / T)}{\\sum_j \\exp(z_j / T)}$$\n\n"
-                "Subscripts like $\\mathcal{L}_{\\text{hard}}$ and $\\mathcal{L}_{\\text{soft}}$ are preserved in both versions."
-                f"\n\n### Offline Compilation Details\n\n{raw_snippet}"
-            ),
-            "content_id": (
-                "## Arsitektur Inti\n\n"
-                "**Distilasi Kompresi (Distillation Compression)** adalah metodologi untuk melatih model yang ringkas. "
-                "Model student belajar memperkirakan distribusi probabilitas logit lengkap dari model teacher yang lebih besar.\n\n"
-                "### Fungsi Objektif (Objective Function)\n"
-                "Kerugian distilasi (distillation loss) menggunakan entropi silang gabungan dengan divergensi Kullback-Leibler (KL) dengan suhu $T$:\n"
-                "$$p_i = \\frac{\\exp(z_i / T)}{\\sum_j \\exp(z_j / T)}$$\n\n"
-                "Subskrip LaTeX seperti $\\mathcal{L}_{\\text{hard}}$ and $\\mathcal{L}_{\\text{soft}}$ dipertahankan dalam versi asli Bahasa Inggris untuk menjaga integritas matematis."
-                f"\n\n### Detail Kompilasi Offline\n\n{raw_snippet}"
-            )
-        })
-        
-    elif "in-context" in lower_content or "icl" in lower_content:
-        concepts.append({
-            "name": "in-context-learning-primer",
-            "title_en": "In-Context Learning Primer",
-            "title_id": "Primer In-Context Learning",
-            "domain": "ai",
-            "tags": ["icl", "prompting", "llm"],
-            "description_en": "The paradigm of enabling LLMs to execute tasks purely based on few-shot input demonstrations.",
-            "description_id": "Paradigma yang memungkinkan LLM mengeksekusi tugas murni berdasarkan demonstrasi input few-shot.",
-            "content_en": (
-                "## Conceptual Overview\n\n"
-                "**In-Context Learning (ICL)** utilizes the latent representations of LLMs "
-                "to recognize patterns from user-provided demonstrations without updating model weights.\n\n"
-                "### Formulation\n"
-                "A prompt contains demonstrations $(x_1, y_1), ..., (x_k, y_k)$ and a new query $x_{k+1}$:\n"
-                "$$P(y \\mid x_{k+1}, D)$$"
-                f"\n\n### Offline Compilation Details\n\n{raw_snippet}"
-            ),
-            "content_id": (
-                "## Tinjauan Konseptual\n\n"
-                "**In-Context Learning (ICL)** memanfaatkan representasi laten dari LLM "
-                "untuk mengenali pola dari demonstrasi yang disediakan pengguna tanpa memperbarui bobot model.\n\n"
-                "### Formulasi\n"
-                "Perintah (prompt) berisi demonstrasi $(x_1, y_1), ..., (x_k, y_k)$ dan kueri baru $x_{k+1}$:\n"
-                "$$P(y \\mid x_{k+1}, D)$$"
-                f"\n\n### Detail Kompilasi Offline\n\n{raw_snippet}"
-            )
-        })
-        
-    # Default fallback concepts if none matched
-    if not concepts:
-        concepts.append({
-            "name": f"{filename_base}-core-concept",
-            "title_en": f"{title_words} Core Concept",
-            "title_id": f"Konsep Inti {title_words}",
-            "domain": "software-engineering",
-            "tags": ["compiled", "general"],
-            "description_en": f"Core concept extracted from {title_words}.",
-            "description_id": f"Konsep inti yang diekstrak dari {title_words}.",
-            "content_en": f"## Overview\n\nThis is the core concept page for [[source-{filename_base}]].",
-            "content_id": f"## Tinjauan\n\nIni adalah halaman konsep inti untuk [[source-{filename_base}-id]]."
-        })
-        
-    for c in concepts:
-        c["version"] = c.get("version") or version
-        c["status"] = c.get("status") or "active"
-    for e in entities:
-        e["version"] = e.get("version") or version
-        e["status"] = e.get("status") or "active"
-
-    # Process sections to build summaries
-    if not summary_parts_en:
-        for sec in sections:
-            title = sec["title"]
-            sec_content = sec["content"][:300] + "..." if len(sec["content"]) > 300 else sec["content"]
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # Check if the name exists and is already English
+        cursor.execute("SELECT lang, translation FROM wiki_metadata WHERE name = ?;", (name,))
+        row = cursor.fetchone()
+        if row:
+            lang, trans = row
+            if lang == "en":
+                return name
+            elif lang == "id" and trans and trans.strip() and trans.strip().lower() != "none":
+                clean_trans = trans.replace("[[", "").replace("]]", "").strip()
+                return clean_trans
+    except Exception:
+        pass
+    finally:
+        if conn:
+            conn.close()
             
-            summary_parts_en.append(f"### Chapter: {title}\n{sec_content}\n")
-            summary_parts_id.append(f"### Bab: {title}\n{sec_content}\n")
-        
-    return {
-        "title_en": title_en,
-        "title_id": title_id,
-        "summary_en": "\n".join(summary_parts_en),
-        "summary_id": "\n".join(summary_parts_id),
-        "concepts": concepts,
-        "entities": entities
-    }
-
     return name
 
-def sanitize_indonesian_latex(content):
-    """
-    Sanitizes LaTeX formulas in Indonesian text to preserve English subscripts
-    (hard, soft, test) instead of translated ones (keras, lunak, uji).
-    Also sanitizes awkward literal Indonesian translations.
-    """
+def scan_existing_pages(vault_root: str):
+    existing_en = set()
+    existing_id = set()
+    wiki_path = os.path.join(vault_root, "wiki")
+    if not os.path.exists(wiki_path):
+        return existing_en, existing_id
+    for root, dirs, files in os.walk(wiki_path):
+        relative_path = os.path.relpath(root, wiki_path).replace("\\", "/")
+        parts = relative_path.split("/")
+        if len(parts) >= 1:
+            lang = parts[0].lower()
+            for f in files:
+                if f.endswith(".md"):
+                    name_no_ext = os.path.splitext(f)[0].lower()
+                    if lang == "en":
+                        existing_en.add(name_no_ext)
+                    elif lang == "id":
+                        existing_id.add(name_no_ext)
+    return existing_en, existing_id
+
+
+def find_source_file_path(source_name: str) -> Optional[str]:
+    en_sources_dir = os.path.join(EN_DIR, "sources")
+    if os.path.exists(en_sources_dir):
+        for root, _, files in os.walk(en_sources_dir):
+            if f"{source_name}.md" in files:
+                return os.path.join(root, f"{source_name}.md")
+    return None
+
+def extract_source_citation(source_name: str) -> str:
+    source_name_en = resolve_canonical_en_name(source_name)
+    if not source_name_en.startswith("source-"):
+        source_name_en = f"source-{source_name_en}"
+        
+    fpath = find_source_file_path(source_name_en)
+    if not fpath:
+        match = re.search(r'source-([A-Za-z]+)-(\d{4})', source_name_en)
+        if match:
+            return f"{match.group(1)} et al. ({match.group(2)})"
+        return source_name.replace("source-", "").replace("-id", "").replace("-", " ").title()
+
+    try:
+        with open(fpath, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        authors = ""
+        year = ""
+        
+        auth_match = re.search(r'\*\*(?:Authors|Penulis):\*\*?\s*(.+)', content, re.IGNORECASE)
+        if auth_match:
+            authors_str = auth_match.group(1).strip()
+            parts = re.split(r',\s*|\s+and\s+', authors_str)
+            if len(parts) > 1:
+                first_author = parts[0].strip()
+                last_name = first_author.split()[-1] if first_author.split() else first_author
+                authors = f"{last_name} et al."
+            elif parts:
+                first_author = parts[0].strip()
+                last_name = first_author.split()[-1] if first_author.split() else first_author
+                authors = last_name
+                
+        pub_match = re.search(r'\*\*(?:Published|Publikasi):\*\*?\s*(.+)', content, re.IGNORECASE)
+        if pub_match:
+            pub_str = pub_match.group(1).strip()
+            year_match = re.search(r'\b(\d{4})\b', pub_str)
+            if year_match:
+                year = year_match.group(1)
+                
+        if not authors or not year:
+            citation_match = re.search(r'\(([A-Za-z\s]+ et al\.),\s*(\d{4})\)', content)
+            if citation_match:
+                if not authors:
+                    authors = citation_match.group(1)
+                if not year:
+                    year = citation_match.group(2)
+                    
+        if not year:
+            year_match = re.search(r'\b(\d{4})\b', source_name_en)
+            if year_match:
+                year = year_match.group(1)
+                
+        if not authors:
+            base_name = source_name_en.replace("source-", "")
+            clean_name = re.sub(r'-\d{4}', '', base_name)
+            authors = clean_name.replace("-", " ").title()
+            
+        if year:
+            return f"{authors} ({year})"
+        else:
+            return authors
+            
+    except Exception:
+        pass
+        
+    return source_name.replace("source-", "").replace("-id", "").replace("-", " ").title()
+
+def get_concept_primary_source(concept_name: str, existing_concepts: dict) -> Optional[str]:
+    if concept_name in existing_concepts:
+        info = existing_concepts[concept_name]
+        sources_val = info.get("sources", "")
+        if isinstance(sources_val, list):
+            sources_list = sources_val
+        elif isinstance(sources_val, str):
+            sources_list = [sources_val]
+        else:
+            sources_list = []
+            
+        for src in sources_list:
+            src_str = str(src).strip()
+            found = re.findall(r'\[\[(.*?)\]\]', src_str)
+            if found:
+                return found[0]
+            if src_str.startswith("[[") and src_str.endswith("]]"):
+                return src_str[2:-2].strip()
+            if src_str:
+                return src_str
+    return None
+
+
+def sanitize_indonesian_latex(content: str) -> str:
+    """Sanitizes Indonesian LaTeX notations and terms to ensure standard terminology."""
     prohibited_map = {
         r"keras": "hard",
         r"lunak": "soft",
         r"uji": "test"
     }
-    
     def replacer(match):
         formula = match.group(0)
         for prohibited, replacement in prohibited_map.items():
@@ -530,491 +245,303 @@ def sanitize_indonesian_latex(content):
     }
     for bad_term, good_term in prohibited_literals.items():
         content = re.sub(bad_term, good_term, content, flags=re.IGNORECASE)
-        
     return content
 
-def parse_version_tuple(v_str):
-    if not v_str:
-        return (1, 0, 0)
-    try:
-        v_str = str(v_str).strip().lower().lstrip('v')
-        return tuple(map(int, v_str.split(".")))
-    except Exception:
-        return (1, 0, 0)
 
-def merge_or_write_page(filepath, frontmatter_dict, markdown_body):
-    """Writes a wiki page. If it already exists, merges the frontmatter and content intelligently.
-    Handles temporal versioning: if the incoming version is newer than the existing page version,
-    deprecates the existing page (moves to archived v[x.y.z] filename) and writes the new one as active."""
-    if not os.path.exists(filepath):
-        frontmatter_dict["version"] = frontmatter_dict.get("version") or "1.0.0"
-        frontmatter_dict["status"] = frontmatter_dict.get("status") or "active"
-        frontmatter_dict["valid_from"] = frontmatter_dict.get("valid_from") or datetime.now().strftime("%Y-%m-%d")
-        write_wiki_page(filepath, frontmatter_dict, markdown_body)
-        return
-        
-    print(f"Page already exists, checking version/merging: {filepath}")
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            existing_content = f.read()
-    except Exception as e:
-        print(f"Warning: Failed to read existing page {filepath} for merging: {e}. Overwriting...")
-        write_wiki_page(filepath, frontmatter_dict, markdown_body)
-        return
-        
-    existing_fm = parse_yaml_frontmatter(existing_content)
-    
-    # Versioning comparison
-    existing_ver_str = existing_fm.get("version") or "1.0.0"
-    incoming_ver_str = frontmatter_dict.get("version") or "1.0.0"
-    
-    existing_ver = parse_version_tuple(existing_ver_str)
-    incoming_ver = parse_version_tuple(incoming_ver_str)
-    
-    if incoming_ver > existing_ver:
-        # Newer version! We must archive/deprecate the existing page and write the new one
-        filename_base = os.path.splitext(os.path.basename(filepath))[0]
-        dir_name = os.path.dirname(filepath)
-        lang = frontmatter_dict.get("lang") or "en"
-        
-        # Determine archived page name
-        archived_name = f"{filename_base}-v{existing_ver_str}"
-        archived_filepath = os.path.join(dir_name, f"{archived_name}.md")
-        
-        # 1. Update old page frontmatter & content
-        deprecated_fm = existing_fm.copy()
-        deprecated_fm["status"] = "deprecated"
-        deprecated_fm["valid_to"] = datetime.now().strftime("%Y-%m-%d")
-        deprecated_fm["superseded_by"] = f"[[{filename_base}]]"
-        
-        # Extract body of old page
-        fm_end = existing_content.find("---", existing_content.find("---") + 3)
-        if fm_end != -1:
-            existing_body = existing_content[fm_end + 3:].strip()
-        else:
-            existing_body = existing_content.strip()
-            
-        # Append timeline to deprecated page
-        timeline_heading = "Riwayat Versi" if lang == "id" else "Version History"
-        timeline_content = (
-            f"\n\n## {timeline_heading}\n\n"
-            f"- [[{filename_base}]] (v{incoming_ver_str} - {'Aktif' if lang == 'id' else 'Active'})\n"
-            f"- [[{archived_name}]] (v{existing_ver_str} - {'Usang' if lang == 'id' else 'Deprecated'})\n"
-        )
-        clean_old_body = re.split(r"\n##\s+(?:Riwayat Versi|Version History)", existing_body)[0].strip()
-        write_wiki_page(archived_filepath, deprecated_fm, clean_old_body + timeline_content)
-        
-        # 2. Write new page to the canonical path
-        new_fm = frontmatter_dict.copy()
-        new_fm["status"] = "active"
-        new_fm["version"] = incoming_ver_str
-        new_fm["valid_from"] = datetime.now().strftime("%Y-%m-%d")
-        new_fm["supersedes"] = f"[[{archived_name}]]"
-        if "created" not in new_fm:
-            new_fm["created"] = existing_fm.get("created") or datetime.now().strftime("%Y-%m-%d")
-        new_fm["updated"] = datetime.now().strftime("%Y-%m-%d")
-        
-        clean_new_body = re.split(r"\n##\s+(?:Riwayat Versi|Version History)", markdown_body)[0].strip()
-        write_wiki_page(filepath, new_fm, clean_new_body + timeline_content)
-        return
+def auto_link_media_and_tables(content: str, filename_base: str, lang: str) -> str:
+    """Scan content for references to Tables and Figures, appending transclusions if found.
 
-    merged_fm = existing_fm.copy()
-    
-    # Preserve original created date
-    if "created" in existing_fm:
-        merged_fm["created"] = existing_fm["created"]
-    else:
-        merged_fm["created"] = frontmatter_dict.get("created")
-        
-    merged_fm["updated"] = frontmatter_dict.get("updated")
-    
-    # Merge sources
-    existing_sources = existing_fm.get("sources", [])
-    if isinstance(existing_sources, str):
-        existing_sources = [existing_sources]
-    new_sources = frontmatter_dict.get("sources", [])
-    if isinstance(new_sources, str):
-        new_sources = [new_sources]
-        
-    merged_sources = list(existing_sources)
-    for src in new_sources:
-        if src not in merged_sources:
-            merged_sources.append(src)
-    merged_fm["sources"] = merged_sources
-    
-    # Merge tags
-    existing_tags = existing_fm.get("tags", [])
-    if isinstance(existing_tags, str):
-        existing_tags = [existing_tags]
-    new_tags = frontmatter_dict.get("tags", [])
-    if isinstance(new_tags, str):
-        new_tags = [new_tags]
-        
-    merged_tags = list(existing_tags)
-    for tag in new_tags:
-        if tag not in merged_tags:
-            merged_tags.append(tag)
-    merged_fm["tags"] = merged_tags
-    
-    # Merge translation
-    if "translation" not in merged_fm or not merged_fm["translation"]:
-        merged_fm["translation"] = frontmatter_dict.get("translation")
-        
-    # Merge other metadata keys
-    for key, value in frontmatter_dict.items():
-        if key not in ["created", "updated", "sources", "tags", "translation"]:
-            merged_fm[key] = value
+    Args:
+        content: The raw markdown content.
+        filename_base: The base name of the source PDF.
+        lang: Language ('en' or 'id').
 
-    # Extract existing body
-    fm_end = existing_content.find("---", existing_content.find("---") + 3)
-    if fm_end != -1:
-        existing_body = existing_content[fm_end + 3:].strip()
-    else:
-        existing_body = existing_content.strip()
-        
-    # Extract existing base body by stripping any See Also / Sources sections
-    split_patterns = [
-        r"\n## See Also", r"\n## Lihat Juga", 
-        r"\n## Sources", r"\n## Sumber",
-        r"\n## Related Entities", r"\n## Entitas Terkait"
-    ]
-    split_idx = len(existing_body)
-    for pat in split_patterns:
-        match = re.search(pat, existing_body)
-        if match and match.start() < split_idx:
-            split_idx = match.start()
-            
-    existing_base_body = existing_body[:split_idx].strip()
-    
-    # Extract core new content
-    new_lines = markdown_body.strip().split("\n")
-    body_lines = []
-    in_exclude_section = False
-    for line in new_lines:
-        if line.startswith("# ") and not body_lines:
-            continue
-        if any(line.strip().startswith(pat) for pat in ["## See Also", "## Lihat Juga", "## Sources", "## Sumber", "## Related Entities", "## Entitas Terkait"]):
-            in_exclude_section = True
-        if in_exclude_section:
-            continue
-        body_lines.append(line)
-        
-    new_core_content = "\n".join(body_lines).strip()
-    
-    simplified_existing = re.sub(r"\s+", "", existing_base_body.lower())
-    simplified_new = re.sub(r"\s+", "", new_core_content.lower())
-    
-    base_body = existing_base_body
-    if simplified_new and simplified_new not in simplified_existing:
-        new_source_ref = ""
-        for src in new_sources:
-            new_source_ref = src.replace("[[", "").replace("]]", "")
-            break
-        source_label = f"Addition from {new_source_ref}" if frontmatter_dict.get("lang") == "en" else f"Tambahan dari {new_source_ref}"
-        base_body += f"\n\n## {source_label}\n\n{new_core_content}"
-        
-    # Rebuild See Also from the old sections text of existing_body
-    old_see_also_text = existing_body[split_idx:]
-    old_links = re.findall(r"\[\[(.*?)\]\]", old_see_also_text)
-    
-    exclude_links = set([s.replace("[[", "").replace("]]", "").strip().lower() for s in merged_sources])
-    exclude_links.add(os.path.splitext(os.path.basename(filepath))[0].lower())
-    
-    new_see_also_links = []
-    if "## See Also" in markdown_body or "## Related Entities" in markdown_body:
-        start_idx = max(markdown_body.find("## See Also"), markdown_body.find("## Related Entities"))
-        new_see_also_links = re.findall(r"\[\[(.*?)\]\]", markdown_body[start_idx:])
-    elif "## Lihat Juga" in markdown_body or "## Entitas Terkait" in markdown_body:
-        start_idx = max(markdown_body.find("## Lihat Juga"), markdown_body.find("## Entitas Terkait"))
-        new_see_also_links = re.findall(r"\[\[(.*?)\]\]", markdown_body[start_idx:])
-        
-    combined_see_also = []
-    for link in old_links + new_see_also_links:
-        clean_lnk = link.split("|")[0].strip()
-        if clean_lnk.lower() not in exclude_links and clean_lnk.lower() not in [l.lower() for l in combined_see_also]:
-            combined_see_also.append(clean_lnk)
-            
-    see_also_section = ""
-    if combined_see_also:
-        if frontmatter_dict.get("type") == "entity":
-            heading = "Related Entities" if frontmatter_dict.get("lang") == "en" else "Entitas Terkait"
-        else:
-            heading = "See Also" if frontmatter_dict.get("lang") == "en" else "Lihat Juga"
-        see_also_section = f"\n\n## {heading}\n\n" + "\n".join([f"- [[{l}]]" for l in combined_see_also])
-        
-    sources_heading = "Sources" if frontmatter_dict.get("lang") == "en" else "Sumber"
-    sources_section = f"\n\n## {sources_heading}\n\n" + "\n".join([f"- [[{s.replace('[[', '').replace(']]', '')}]]" for s in merged_sources])
-    
-    write_wiki_page(filepath, merged_fm, base_body + see_also_section + sources_section)
-
-def scan_vault_pages():
-    """Scans the wiki vault to build a mapping of page titles and names to filenames.
-    
-    Returns: dict mapping lowercase title/name variants to {lang: actual_filename}.
-    This allows resolving Title Case wikilinks like [[Many-Shot In-Context Learning]]
-    to their actual kebab-case filename like many-shot-in-context-learning.
-    
-    Also extracts translation pairs from frontmatter so that EN titles can
-    be resolved to ID filenames even when the ID file doesn't follow the
-    '{name}-id' convention (e.g. 'distilasi-pengetahuan' for 'knowledge-distillation').
+    Returns:
+        The content with appended media/table transclusion links if they exist.
     """
-    mapping = {}  # {lowercase_key: {"en": filename, "id": filename}}
-    # Track translation pairs: {en_filename: id_filename} and vice versa
-    translation_pairs = {}  # {filename: translation_target_filename}
-    
-    for root, _, files in os.walk(WIKI_DIR):
-        for file in files:
-            if not file.endswith(".md"):
-                continue
-            filepath = os.path.join(root, file)
-            name = os.path.splitext(file)[0]
-            
-            # Determine language from path
-            norm_path = filepath.replace("\\", "/")
-            if "/en/" in norm_path:
-                lang = "en"
-            elif "/id/" in norm_path:
-                lang = "id"
-            else:
-                continue
-            
-            # Register by filename (kebab-case)
-            key = name.lower()
-            if key not in mapping:
-                mapping[key] = {}
-            mapping[key][lang] = name
-            
-            # Read the file to extract heading and translation field
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read()
-                
-                # Extract h1 heading
-                for line in content.split("\n"):
-                    line = line.strip()
-                    if line.startswith("# "):
-                        title = line[2:].strip()
-                        title_clean = title.replace("**", "")
-                        for variant in [title.lower(), title_clean.lower()]:
-                            if variant not in mapping:
-                                mapping[variant] = {}
-                            mapping[variant][lang] = name
-                        break
-                
-                # Extract translation field from frontmatter
-                trans_match = re.search(r'translation:\s*"?\[\[([^\]]+)\]\]"?', content)
-                if trans_match:
-                    trans_target = trans_match.group(1).strip()
-                    translation_pairs[name.lower()] = trans_target.lower()
-            except Exception:
-                pass
-    
-    # Enrich mapping with translation pairs:
-    # If EN page 'knowledge-distillation' translates to 'distilasi-pengetahuan',
-    # and EN heading 'Knowledge Distillation' maps to EN filename,
-    # then we also map 'Knowledge Distillation' → ID filename 'distilasi-pengetahuan'
-    for source_name, trans_name in translation_pairs.items():
-        # Find the target filename entry
-        if trans_name not in mapping:
+    # 1. Look for figures: e.g. "Figure 1", "Fig. 2", "Gambar 3"
+    fig_mentions = re.findall(r"\b(?:Figure|Fig\.|Gambar)\s+(\d+)", content, re.IGNORECASE)
+    fig_links = []
+    seen_figs = set()
+    for num in fig_mentions:
+        if num in seen_figs:
             continue
-        trans_entry = mapping[trans_name]
-        source_entry = mapping.get(source_name, {})
+        seen_figs.add(num)
         
-        source_lang = "en" if "en" in source_entry else ("id" if "id" in source_entry else None)
-        if not source_lang:
-            continue
-        target_lang = "id" if source_lang == "en" else "en"
-        
-        if target_lang not in trans_entry:
-            continue
-        target_filename = trans_entry[target_lang]
-        
-        # Find all keys that map to the source filename and add target_lang mapping
-        for key, lang_map in mapping.items():
-            if lang_map.get(source_lang) == source_entry.get(source_lang):
-                if target_lang not in lang_map:
-                    lang_map[target_lang] = target_filename
-    
-    return mapping
-
-def build_link_map(vault_pages, concepts, entities, target_lang):
-    """Builds a wikilink normalization map for the target language.
-    
-    Maps any wikilink text variant (Title Case, kebab-case, etc.) to the
-    correct kebab-case filename for the target language.
-    
-    Includes cross-language resolution: EN headings like 'Reinforced ICL'
-    are mapped to their ID equivalents ('reinforced-icl-id') when building
-    the ID link map, and vice versa.
-    
-    Example for target_lang='id':
-      'many-shot in-context learning' -> 'many-shot-in-context-learning-id'
-      'Many-Shot In-Context Learning' -> 'many-shot-in-context-learning-id'
-      'reinforced icl'                -> 'reinforced-icl-id'
-    
-    Example for target_lang='en':
-      'Many-Shot In-Context Learning' -> 'many-shot-in-context-learning'
-    """
-    link_map = {}  # {lowercase_variant: correct_filename}
-    
-    # 1. From vault scan — existing pages in the vault
-    for key, lang_map in vault_pages.items():
-        if target_lang in lang_map:
-            target = lang_map[target_lang]
-            link_map[key] = target
-            # Also map space→hyphen variant
-            kebab = key.replace(" ", "-")
-            if kebab != key:
-                link_map[kebab] = target
-    
-    # 2. Cross-language heading resolution
-    #    If building ID map: map EN headings → ID filenames
-    #    If building EN map: map ID headings → EN filenames
-    other_lang = "en" if target_lang == "id" else "id"
-    for key, lang_map in vault_pages.items():
-        # Skip if target lang already has this mapping
-        if key in link_map:
-            continue
-        # If the other language has a page for this key,
-        # check if target language has a corresponding page
-        if other_lang in lang_map:
-            other_name = lang_map[other_lang]
-            # Derive the expected target-lang filename by convention:
-            # EN→ID: add '-id' suffix  |  ID→EN: strip '-id' suffix
-            expected_key = None
-            for k, lm in vault_pages.items():
-                if lm.get(other_lang) == other_name and target_lang in lm:
-                    expected_key = lm[target_lang].lower()
+        # Check if the figure file exists in wiki/assets/images
+        assets_dir = os.path.join("wiki", "assets", "images")
+        if os.path.exists(assets_dir):
+            for file in os.listdir(assets_dir):
+                if file.startswith(f"source-{filename_base}-fig{num}."):
+                    fig_links.append(f"![[{file}]]")
                     break
-            
-            if not expected_key:
-                if target_lang == "id":
-                    expected_id_name = f"{other_name}-id"
-                    expected_key = expected_id_name.lower()
-                else:
-                    if other_name.endswith("-id"):
-                        expected_en_name = other_name[:-3]
-                        expected_key = expected_en_name.lower()
-                    else:
-                        continue
-            
-            # Check if the expected page actually exists in vault
-            if expected_key in vault_pages and target_lang in vault_pages[expected_key]:
-                target = vault_pages[expected_key][target_lang]
-                link_map[key] = target
-                kebab = key.replace(" ", "-")
-                if kebab != key:
-                    link_map[kebab] = target
-    
-    # 3. From current batch concepts
-    for c in concepts:
-        en_name = c.get("name") or c.get("title_en", "").lower().replace(" ", "-")
-        if not en_name:
+                    
+    # 2. Look for tables: e.g. "Table 1", "Tabel 4"
+    tab_mentions = re.findall(r"\b(?:Table|Tabel)\s+(\d+)", content, re.IGNORECASE)
+    tab_links = []
+    seen_tabs = set()
+    for num in tab_mentions:
+        if num in seen_tabs:
             continue
-        target = f"{en_name}-id" if target_lang == "id" else en_name
-        title_en = c.get("title_en") or en_name.replace("-", " ").title()
-        title_id = c.get("title_id", "")
+        seen_tabs.add(num)
         
-        # Map all possible variants the LLM might generate
-        link_map[en_name.lower()] = target
-        link_map[title_en.lower()] = target
-        link_map[title_en.lower().replace(" ", "-")] = target
-        if title_id:
-            link_map[title_id.lower()] = target
-            link_map[title_id.lower().replace(" ", "-")] = target
-    
-    # 4. From current batch entities
-    for e in entities:
-        en_name = e.get("name") or e.get("title_en", "").lower().replace(" ", "-")
-        if not en_name:
-            continue
-        target = f"{en_name}-id" if target_lang == "id" else en_name
-        title_en = e.get("title_en") or en_name.replace("-", " ").title()
-        title_id = e.get("title_id", "")
+        # Check if the experiments subpage exists and has the table header
+        experiments_name = f"source-{filename_base}-experiments" + ("-id" if lang == "id" else "")
+        experiments_dir = os.path.join("wiki", lang, "sources", filename_base)
+        experiments_path = os.path.join(experiments_dir, f"{experiments_name}.md")
         
-        link_map[en_name.lower()] = target
-        link_map[title_en.lower()] = target
-        link_map[title_en.lower().replace(" ", "-")] = target
-        if title_id:
-            link_map[title_id.lower()] = target
-            link_map[title_id.lower().replace(" ", "-")] = target
-    
-    return link_map
+        if os.path.exists(experiments_path):
+            with open(experiments_path, "r", encoding="utf-8") as f:
+                exp_content = f.read()
+            # Look for header matching "### Table {num} (Page" or similar
+            match = re.search(fr"###\s+Table\s+{num}\s+\(Page\s+(\d+)\)", exp_content, re.IGNORECASE)
+            if match:
+                page_num = match.group(1)
+                tab_links.append(f"![[{experiments_name}#Table {num} (Page {page_num})]]")
+                
+    # 3. Append to content
+    append_str = ""
+    if fig_links:
+        header = "### Supporting Figures" if lang == "en" else "### Gambar Pendukung"
+        append_str += f"\n\n{header}\n\n" + "\n\n".join(fig_links)
+    if tab_links:
+        header = "### Supporting Tables" if lang == "en" else "### Tabel Pendukung"
+        append_str += f"\n\n{header}\n\n" + "\n\n".join(tab_links)
+        
+    return content + append_str
 
-def normalize_wikilinks(content, link_map):
-    """Normalizes all wikilinks in content to use correct kebab-case filenames.
-    
-    Converts Title Case links like [[Many-Shot In-Context Learning]] to the
-    actual filename like [[many-shot-in-context-learning]] or [[many-shot-in-context-learning-id]].
+
+def sanitize_concept_name(name: str) -> str:
+    """Sanitizes a concept/entity name to keep only alphanumeric characters and hyphens,
+    ensuring safe file creation on all operating systems.
     """
-    if not link_map:
-        return content
+    # Replace illegal/special chars with spaces, then strip and convert to kebab-case
+    cleaned = re.sub(r"[\\/:*?\"<>|\[\]#]", " ", name)
+    cleaned = re.sub(r"\s+", "-", cleaned.strip().lower())
+    cleaned = re.sub(r"-+", "-", cleaned)
+    return cleaned.strip("-")
+
+
+def find_existing_concept_domain(c_name: str, base_dir: str) -> Optional[str]:
+    """Scans all subfolders in the base directory to see if a page already exists.
+    If found, returns the domain directory name (e.g. 'ai', 'finance').
+    """
+    if not os.path.exists(base_dir):
+        return None
+    for domain_dir in os.listdir(base_dir):
+        domain_path = os.path.join(base_dir, domain_dir)
+        if os.path.isdir(domain_path):
+            if os.path.exists(os.path.join(domain_path, f"{c_name}.md")):
+                return domain_dir
+    return None
+
+
+def get_known_concept_names(concepts_dir: str) -> set:
+    """Scans all existing concept pages from a vault concepts directory to build a set of known concept names."""
+    known = set()
+    if not os.path.exists(concepts_dir):
+        return known
+    for root, dirs, files in os.walk(concepts_dir):
+        for file in files:
+            if file.endswith(".md"):
+                name = os.path.splitext(file)[0]
+                known.add(name)
+                # Also index the base concept name if it's an ID page ending with -id
+                if name.endswith("-id"):
+                    known.add(name[:-3])
+    return known
+
+
+def reclassify_concepts_and_entities(concepts: list, entities: list, concepts_dir: str) -> tuple:
+    """Classification safeguard to automatically move abstract concepts from entities to concepts."""
+    known_concepts = get_known_concept_names(concepts_dir)
     
-    def replace_link(match):
-        full = match.group(1)
-        parts = full.split("|")
-        target = parts[0].strip()
-        target_lower = target.lower()
-        target_kebab = target_lower.replace(" ", "-")
+    # Keywords indicating a concept
+    CONCEPT_KEYWORDS = {
+        "formula", "drift", "disconnect", "variance", "index", "ratio", 
+        "theorem", "accounting", "hypothesis", "bias", "fallacy", 
+        "anomaly", "effect", "premium", "factor", "pricing", "multiplier",
+        "correlation", "causality", "law", "illusion", "puzzle", "syndrome",
+        "paradox", "model", "valuation", "pricing", "efficiency"
+    }
+    
+    new_concepts = list(concepts)
+    new_entities = []
+    
+    for entity in entities:
+        name = entity.get("name", "")
+        # Lowercase and split name by hyphen to check for keywords
+        name_parts = set(name.lower().split("-"))
         
-        new_target = link_map.get(target_lower) or link_map.get(target_kebab)
-        if new_target and new_target != target:
-            if len(parts) > 1:
-                return f"[[{new_target}|{parts[1]}]]"
-            return f"[[{new_target}]]"
-        return match.group(0)
-    
-    return re.sub(r"\[\[(.*?)\]\]", replace_link, content)
-
-
-def format_frontmatter(metadata):
-    """Helper to cleanly format frontmatter dictionary back into a YAML string."""
-    lines = ["---"]
-    for k, v in metadata.items():
-        if isinstance(v, list):
-            list_str = ", ".join([f'"{item}"' if "[[" in item else item for item in v])
-            lines.append(f"{k}: [{list_str}]")
+        category = entity.get("category", "").lower()
+        
+        # We classify as concept if:
+        # 1. It is already known as a concept in the vault
+        # 2. Or it contains any concept keyword AND is not explicitly a person
+        is_concept = (
+            name in known_concepts 
+            or (not name_parts.isdisjoint(CONCEPT_KEYWORDS) and category != "person")
+        )
+        
+        if is_concept:
+            print(f"ℹ️ Reclassifying entity '{name}' to concept based on keyword or vault scan.")
+            concept_obj = entity.copy()
+            # Ensure it has the fields required by concepts
+            if "description_en" not in concept_obj:
+                concept_obj["description_en"] = entity.get("content_en") or entity.get("description_en") or ""
+            if "description_id" not in concept_obj:
+                concept_obj["description_id"] = entity.get("content_id") or entity.get("description_id") or ""
+            if "content_en" not in concept_obj:
+                concept_obj["content_en"] = entity.get("content_en") or ""
+            if "content_id" not in concept_obj:
+                concept_obj["content_id"] = entity.get("content_id") or ""
+            if "relations" not in concept_obj:
+                concept_obj["relations"] = []
+            new_concepts.append(concept_obj)
         else:
-            if isinstance(v, str) and (":" in v or "[" in v or "{" in v):
-                lines.append(f'{k}: "{v}"')
-            else:
-                lines.append(f"{k}: {v}")
-    lines.append("---")
-    return "\n".join(lines)
+            new_entities.append(entity)
+            
+    return new_concepts, new_entities
 
-def write_wiki_page(filepath, frontmatter_dict, markdown_body):
-    """Writes a wiki page ensuring directories exist and format is standardized."""
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    full_content = format_frontmatter(frontmatter_dict) + "\n\n" + markdown_body.strip() + "\n"
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(full_content)
-    print(f"Created/Updated Page: {filepath}")
+def cleanup_duplicate_empty_files():
+    """Finds the vault root (containing .obsidian), scans for 0-byte markdown files,
+    and deletes them if they conflict with any compiled wiki concepts or entities.
+    """
+    vault_root = None
+    # Start searching up from current script folder
+    curr = os.path.abspath(os.path.dirname(os.path.abspath(__file__)))
+    while True:
+        if os.path.exists(os.path.join(curr, ".obsidian")):
+            vault_root = curr
+            break
+        parent = os.path.dirname(curr)
+        if parent == curr:
+            break
+        curr = parent
+        
+    if not vault_root:
+        return
+        
+    import sqlite3
+    db_path = os.path.join("wiki", ".search_index.db")
+    if not os.path.exists(db_path):
+        return
+        
+    valid_names = set()
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='wiki_metadata';")
+        if cursor.fetchone():
+            cursor.execute("SELECT name, title FROM wiki_metadata;")
+            for name, title in cursor.fetchall():
+                if name:
+                    valid_names.add(name.lower())
+                    valid_names.add(name.lower().replace("-", " "))
+                    valid_names.add(name.lower().replace(" ", "-"))
+                if title:
+                    valid_names.add(title.lower())
+                    valid_names.add(title.lower().replace("-", " "))
+                    valid_names.add(title.lower().replace(" ", "-"))
+        conn.close()
+    except Exception as e:
+        print(f"Warning: Failed to query database for cleanup: {e}")
+        return
+
+    deleted = []
+    # Scan the vault root recursively, ignoring system, raw, scratch, and config directories
+    ignore_dirs = {".git", ".obsidian", ".pytest_cache", ".superpowers", ".agents", "raw", "scripts", "docs", "scratch"}
+    for root, dirs, files in os.walk(vault_root):
+        # Modify dirs in-place to avoid walking into ignored directories
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        for f in files:
+            if f.endswith(".md"):
+                filepath = os.path.join(root, f)
+                try:
+                    if os.path.isfile(filepath) and os.path.getsize(filepath) == 0:
+                        name_no_ext = os.path.splitext(f)[0].lower()
+                        name_clean = name_no_ext.replace("-id", "")
+                        if (name_no_ext in valid_names or 
+                            name_clean in valid_names or 
+                            name_no_ext.replace(" ", "-") in valid_names or 
+                            name_no_ext.replace("-", " ") in valid_names):
+                            os.remove(filepath)
+                            deleted.append(os.path.relpath(filepath, vault_root))
+                except Exception:
+                    pass
+                        
+    if deleted:
+        print(f"🧹 Safeguard: Cleaned up {len(deleted)} duplicate 0-byte file(s) from vault: {', '.join(deleted)}")
+
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python scripts/ingest.py <path-to-raw-file>")
+    force = False
+    metadata_file = None
+    args = sys.argv[1:]
+    
+    # Check for --force / -f / force
+    if "--force" in args:
+        force = True
+        args.remove("--force")
+    if "-f" in args:
+        force = True
+        args.remove("-f")
+    if "force" in args:
+        force = True
+        args.remove("force")
+        
+    # Check for --metadata / -m
+    if "--metadata" in args:
+        try:
+            idx = args.index("--metadata")
+            metadata_file = args[idx + 1]
+            args.pop(idx + 1)
+            args.pop(idx)
+        except IndexError:
+            print("Error: --metadata option requires a file path argument.")
+            sys.exit(1)
+    elif "-m" in args:
+        try:
+            idx = args.index("-m")
+            metadata_file = args[idx + 1]
+            args.pop(idx + 1)
+            args.pop(idx)
+        except IndexError:
+            print("Error: -m option requires a file path argument.")
+            sys.exit(1)
+            
+    if not args or len(args) < 1:
+        print("Usage: python scripts/ingest.py <path-to-raw-file> [--force] [--metadata <path-to-json>]")
         sys.exit(1)
         
-    raw_path = sys.argv[1]
+    raw_path = args[0]
+    try:
+        # Validate path safety
+        raw_path = validate_safe_path(raw_path)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+        
     if not os.path.exists(raw_path):
         print(f"Error: Raw input file not found at '{raw_path}'")
         sys.exit(1)
         
     print(f"Starting ingestion workflow for: {raw_path}")
     
-    # 1. Compute Checksum
     checksum = calculate_sha256(raw_path)
     print(f"Calculated SHA-256 Checksum: {checksum}")
     
-    # 2. Check for Duplicates
-    source_filename = os.path.normpath(raw_path).replace("\\", "/")
+    source_filename = project_relative_path(raw_path)
+        
     duplicate_path = check_duplicate(checksum, source_filename)
-    if duplicate_path:
+    if duplicate_path and not force:
         print(f"Source asset already compiled! Checksum/Filename match: {duplicate_path}")
-        print("Skipping ingestion to prevent duplication.")
+        print("Skipping ingestion to prevent duplication. Use --force to override.")
         sys.exit(0)
         
-    # Read raw content
+    is_pdf_paper = raw_path.lower().endswith(".pdf") and ("raw/papers/" in raw_path.replace("\\", "/"))
+    filename_base = os.path.splitext(os.path.basename(raw_path))[0]
+    
     if raw_path.lower().endswith(".pdf"):
         print("Detected PDF input. Extracting text using multiprocessing and OCR Fallback...")
         tessdata_path = os.environ.get("TESSDATA_PREFIX")
@@ -1026,9 +553,11 @@ def main():
     else:
         with open(raw_path, "r", encoding="utf-8") as f:
             raw_content = f.read()
-        
-    filename_base = os.path.splitext(os.path.basename(raw_path))[0]
-    
+            
+    tables_content = ""
+    images_content = ""
+    # Image and table extraction is disabled.
+            
     raw_source_dir = os.path.join(WIKI_DIR, "raw_sources")
     os.makedirs(raw_source_dir, exist_ok=True)
     raw_source_path = os.path.join(raw_source_dir, f"{filename_base}.txt")
@@ -1036,54 +565,302 @@ def main():
         rf.write(raw_content)
     print(f"Saved complete raw source text to: {raw_source_path}")
     
-    # 3. Process Content (DeepSeek LLM or Offline Fallback)
     raw_version = "1.0.0"
     try:
-        raw_fm = parse_yaml_frontmatter(raw_content)
+        from parser import parse_yaml_frontmatter as local_parse
+        raw_fm = local_parse(raw_content)
         if raw_fm and "version" in raw_fm:
             raw_version = str(raw_fm["version"])
     except Exception:
         pass
 
-    data = process_deepseek(raw_content, os.path.basename(raw_path), version=raw_version)
-    if data and os.environ.get("DEEPSEEK_API_KEY"):
-        eval_result = run_groundedness_evaluation(raw_content, data.get("summary_en", ""), filename_base)
-        if "APPROVED" not in eval_result:
-            print(f"⚠️ Ingestion Auditor flagged nuances gaps:\n{eval_result}")
-            
+    data = None
+    if metadata_file:
+        print(f"Loading pre-generated cognitive metadata from: {metadata_file}")
+        try:
+            import json
+            with open(metadata_file, "r", encoding="utf-8") as mf:
+                data = json.load(mf)
+        except Exception as e:
+            print(f"Error: Failed to load metadata from '{metadata_file}': {e}")
+            sys.exit(1)
+    else:
+        try:
+            data = process_deepseek(raw_content, os.path.basename(raw_path), version=raw_version)
+        except Exception as e:
+            print(f"DeepSeek compilation failed: {e}. Falling back to offline pipeline...")
+            data = None
+
     if not data:
+        from ingest.local_fallback import PRE_TRANSLATED_SUMMARIES
+        if filename_base not in PRE_TRANSLATED_SUMMARIES and not os.environ.get("TESTING"):
+            print("\n" + "!" * 80)
+            print("⚠️  API KEY MISSING OR OFFLINE - COGNITIVE ACTION REQUIRED BY AGENT")
+            print("   The document is UNRECOGNIZED offline and no LLM API key is configured.")
+            print("   Exiting with Code 2 to signal your AI agent (Antigravity) to handle the ")
+            print("   cognitive ingestion steps (chunk reading, summarization, relations) directly.")
+            print("!" * 80 + "\n")
+            sys.exit(2)
         data = process_offline(raw_content, filename_base, version=raw_version)
         
-    # Standard date
     current_date = datetime.now().strftime("%Y-%m-%d")
-    
-    # 4. Generate Parallel Source Pages
     source_name_en = f"source-{filename_base}"
     source_name_id = f"source-{filename_base}-id"
     
-    source_path_en = os.path.join(EN_DIR, "sources", f"{source_name_en}.md")
-    source_path_id = os.path.join(ID_DIR, "sources", f"{source_name_id}.md")
+    en_src_dir = os.path.join(EN_DIR, "sources")
+    id_src_dir = os.path.join(ID_DIR, "sources")
+    os.makedirs(en_src_dir, exist_ok=True)
+    os.makedirs(id_src_dir, exist_ok=True)
+        
+    source_path_en = os.path.join(en_src_dir, f"{source_name_en}.md")
+    source_path_id = os.path.join(id_src_dir, f"{source_name_id}.md")
     
-    # Prepare list of created pages for logs
     created_concepts = []
     created_entities = []
-    
-    # Extract concepts and entities lists
     concepts = data.get("concepts", []) or []
     entities = data.get("entities", []) or []
     
-    concept_links_en = [f"[[{c.get('name')}]]" for c in concepts if c.get('name')]
-    concept_links_id = [f"[[{c.get('name')}-id]]" for c in concepts if c.get('name')]
+    # Pre-sanitize all concept and entity names, as well as relation targets
+    for c in concepts:
+        c["name"] = sanitize_concept_name(c.get("name") or c.get("title_en", ""))
+        for r in c.get("relations", []) or []:
+            if "target" in r:
+                r["target"] = sanitize_concept_name(r["target"])
+    for e in entities:
+        e["name"] = sanitize_concept_name(e.get("name") or e.get("title_en", ""))
+
     
+    # Classification safeguard to reclassify abstract concepts that LLM put under entities
+    concepts, entities = reclassify_concepts_and_entities(concepts, entities, os.path.join(EN_DIR, "concepts"))
+    
+    # Detect cross-references early so we can build the summary tables on source pages
+    print("Detecting cross-references with existing vault concepts...")
+    en_concepts_dir = os.path.join(EN_DIR, "concepts")
+    cross_refs = detect_cross_references(concepts, source_name_en, en_concepts_dir, lang="en")
+    
+    # Read existing concepts from the vault to identify which concepts are core vs related
+    existing_concepts = read_concept_pages(en_concepts_dir)
+    id_concepts_dir = os.path.join(ID_DIR, "concepts")
+    existing_concepts_id = read_concept_pages(id_concepts_dir)
+    
+    vault_root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    existing_en_pages, existing_id_pages = scan_existing_pages(vault_root_dir)
+    
+    new_en_pages = {source_name_en.lower()}
+    new_id_pages = {source_name_id.lower()}
+    for c in concepts:
+        c_name = c.get("name")
+        if c_name:
+            new_en_pages.add(c_name.lower())
+            new_id_pages.add(resolve_translation_target(c_name, "id").lower())
+    for e in entities:
+        e_name = e.get("name")
+        if e_name:
+            new_en_pages.add(e_name.lower())
+            new_id_pages.add(resolve_translation_target(e_name, "id").lower())
+            
+    valid_en_pages = existing_en_pages | new_en_pages
+    valid_id_pages = existing_id_pages | new_id_pages
+    
+    core_concepts = list(concepts)
+    related_concept_names = set()
+            
+    # Group relations by target and populate related_concept_names
+    relations_by_target = {}
+    for c_name, rels in cross_refs.items():
+        c_obj = next((x for x in concepts if x.get("name") == c_name), None)
+        c_relations = list(rels)
+        if c_obj and c_obj.get("relations"):
+            c_relations.extend(c_obj.get("relations"))
+            
+        # Merge relations from existing concept pages in the vault
+        if c_name in existing_concepts and existing_concepts[c_name].get("relations"):
+            c_relations.extend(existing_concepts[c_name]["relations"])
+            
+        seen_keys = set()
+        unique_relations = []
+        for r in c_relations:
+            target = r.get("target", "")
+            if target:
+                target = target.replace("[[", "").replace("]]", "").strip()
+                r["target"] = target
+                r["concept_name"] = c_name
+                rel_type = r.get("type", "")
+                key = (target, rel_type)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_relations.append(r)
+                    
+        for r in unique_relations:
+            target = r["target"]
+            related_concept_names.add(target)
+            relations_by_target.setdefault(target, []).append(r)
+                
+    # Exclude core concepts from related connections list
+    core_names = {c.get("name") for c in core_concepts}
+    related_concept_names = {r for r in related_concept_names if r not in core_names}
+
+    # Format Core Concepts (English)
+    core_concepts_section = "## Core Concepts\n\n"
+    if core_concepts:
+        core_bullets = []
+        for c in core_concepts:
+            c_name = c.get("name")
+            c_title = c.get("title_en") or c_name.replace("-", " ").title()
+            if c_name:
+                core_bullets.append(f"- **{c_title}:** [[{c_name}]]")
+        core_concepts_section += "\n".join(core_bullets)
+    else:
+        core_concepts_section += "*No core concepts defined.*"
+
+    # Format Related Work Connections (English)
+    related_work_section = "## Related Work Connections\n\n"
+    if related_concept_names:
+        related_bullets = []
+        for target in sorted(related_concept_names):
+            rels = relations_by_target.get(target, [])
+            
+            source_page = get_concept_primary_source(target, existing_concepts)
+            source_exists = source_page and (source_page.lower() in valid_en_pages)
+            if source_exists:
+                citation = extract_source_citation(source_page)
+                cit_prefix = f"[[{source_page}|{citation}]]"
+            else:
+                if source_page:
+                    cit_prefix = extract_source_citation(source_page)
+                elif target.startswith("source-"):
+                    citation = extract_source_citation(target)
+                    if target.lower() in valid_en_pages:
+                        cit_prefix = f"[[{target}|{citation}]]"
+                    else:
+                        cit_prefix = citation
+                else:
+                    cit_prefix = target.replace("-", " ").title()
+                    
+            target_exists = target.lower() in valid_en_pages
+            
+            if rels:
+                rel_strs = []
+                for r in rels:
+                    rel_type = r.get("type", "")
+                    claim = r.get("claim_en") or r.get("claim", "")
+                    rel_str = f"({rel_type}): {claim}"
+                    if rel_str not in rel_strs:
+                        rel_strs.append(rel_str)
+                if target.startswith("source-"):
+                    related_bullets.append(f"- **{cit_prefix}** — " + "; ".join(rel_strs))
+                elif target_exists:
+                    related_bullets.append(f"- **{cit_prefix}** — " + "; ".join(rel_strs) + f" (🌐 [[{target}]])")
+                else:
+                    related_bullets.append(f"- **{cit_prefix}** — " + "; ".join(rel_strs) + f" (🌐 {target.replace('-', ' ').title()})")
+            else:
+                if target.startswith("source-"):
+                    related_bullets.append(f"- **{cit_prefix}**")
+                elif target_exists:
+                    related_bullets.append(f"- **{cit_prefix}** (🌐 [[{target}]])")
+                else:
+                    related_bullets.append(f"- **{cit_prefix}** (🌐 {target.replace('-', ' ').title()})")
+        related_work_section += "\n".join(related_bullets)
+    else:
+        related_work_section += "*No related work connections.*"
+
+    # Format Core Concepts (Indonesian)
+    core_concepts_section_id = "## Konsep Inti\n\n"
+    if core_concepts:
+        core_bullets_id = []
+        for c in core_concepts:
+            c_name = c.get("name")
+            c_title = c.get("title_id") or c.get("title_en") or c_name.replace("-", " ").title()
+            if c_name:
+                target_id = resolve_translation_target(c_name, "id")
+                core_bullets_id.append(f"- **{c_title}:** [[{target_id}]]")
+        core_concepts_section_id += "\n".join(core_bullets_id)
+    else:
+        core_concepts_section_id += "*Tidak ada konsep inti yang didefinisikan.*"
+
+    # Format Related Work Connections (Indonesian)
+    related_work_section_id = "## Koneksi Penelitian Terkait (Related Work Connections)\n\n"
+    if related_concept_names:
+        related_bullets_id = []
+        for target in sorted(related_concept_names):
+            rels = relations_by_target.get(target, [])
+            target_id = resolve_translation_target(target, "id")
+            
+            source_page = get_concept_primary_source(target, existing_concepts)
+            source_page_id = resolve_translation_target(source_page, "id") if source_page else None
+            
+            source_exists = source_page_id and (source_page_id.lower() in valid_id_pages)
+            if source_exists:
+                citation = extract_source_citation(source_page)
+                cit_prefix = f"[[{source_page_id}|{citation}]]"
+            else:
+                if source_page:
+                    cit_prefix = extract_source_citation(source_page)
+                elif target.startswith("source-"):
+                    citation = extract_source_citation(target)
+                    target_id_page = resolve_translation_target(target, "id")
+                    if target_id_page.lower() in valid_id_pages:
+                        cit_prefix = f"[[{target_id_page}|{citation}]]"
+                    else:
+                        cit_prefix = citation
+                else:
+                    cit_prefix = target.replace("-", " ").title()
+                    
+            target_id_exists = target_id.lower() in valid_id_pages
+            
+            if rels:
+                rel_strs = []
+                for r in rels:
+                    rel_type = r.get("type", "")
+                    rel_type_id = {"supports": "mendukung", "contradicts": "bertentangan", "contrasting": "bertentangan", "extends": "memperluas"}.get(rel_type, rel_type)
+                    
+                    claim = r.get("claim_id")
+                    if not claim:
+                        concept_name = r.get("concept_name")
+                        if concept_name:
+                            concept_name_id = resolve_translation_target(concept_name, "id")
+                            if concept_name_id in existing_concepts_id:
+                                id_rels = existing_concepts_id[concept_name_id].get("relations", [])
+                                target_id_clean = resolve_translation_target(r.get("target", ""), "id")
+                                for id_r in id_rels:
+                                    id_target_clean = id_r.get("target", "").replace("[[", "").replace("]]", "").strip()
+                                    if id_target_clean == target_id_clean and id_r.get("type") == rel_type:
+                                        claim = id_r.get("claim")
+                                        break
+                                        
+                    if not claim:
+                        claim = r.get("claim_en") or r.get("claim", "")
+                        
+                    rel_str = f"({rel_type_id}): {claim}"
+                    if rel_str not in rel_strs:
+                        rel_strs.append(rel_str)
+                if target.startswith("source-"):
+                    related_bullets_id.append(f"- **{cit_prefix}** — " + "; ".join(rel_strs))
+                elif target_id_exists:
+                    related_bullets_id.append(f"- **{cit_prefix}** — " + "; ".join(rel_strs) + f" (🌐 [[{target_id}]])")
+                else:
+                    target_display = target_id.replace("-", " ").title()
+                    related_bullets_id.append(f"- **{cit_prefix}** — " + "; ".join(rel_strs) + f" (🌐 {target_display})")
+            else:
+                if target.startswith("source-"):
+                    related_bullets_id.append(f"- **{cit_prefix}**")
+                elif target_id_exists:
+                    related_bullets_id.append(f"- **{cit_prefix}** (🌐 [[{target_id}]])")
+                else:
+                    target_display = target_id.replace("-", " ").title()
+                    related_bullets_id.append(f"- **{cit_prefix}** (🌐 {target_display})")
+        related_work_section_id += "\n".join(related_bullets_id)
+    else:
+        related_work_section_id += "*Tidak ada koneksi penelitian terkait.*"
+
     entity_links_en = [f"[[{e.get('name')}]]" for e in entities if e.get('name')]
-    entity_links_id = [f"[[{e.get('name')}-id]]" for e in entities if e.get('name')]
+    entity_links_id = [f"[[{resolve_translation_target(e.get('name'), 'id')}]]" for e in entities if e.get('name')]
     
     title_en = data.get('title_en') or filename_base.replace("-", " ").title()
     summary_en = data.get('summary_en') or ''
     title_id = sanitize_indonesian_latex(data.get('title_id') or title_en)
     summary_id = sanitize_indonesian_latex(data.get('summary_id') or summary_en)
     
-    # 4.1 Write English Source Summary
     src_fm_en = {
         "type": "source",
         "source_file": source_filename,
@@ -1093,15 +870,9 @@ def main():
         "translation": f"[[{source_name_id}]]",
         "tags": ["ingested", filename_base]
     }
-    src_body_en = f"# Source Summary: {title_en}\n\n{summary_en}\n\n## Core Concepts\n"
-    if concept_links_en:
-        src_body_en += "\n".join([f"- {link}" for link in concept_links_en])
-    else:
-        src_body_en += "*No core concepts linked.*"
-        
-    write_wiki_page(source_path_en, src_fm_en, src_body_en)
-    
-    # 4.2 Write Indonesian Source Summary
+    if data.get("tags"):
+        src_fm_en["tags"] = data["tags"]
+
     src_fm_id = {
         "type": "source",
         "source_file": source_filename,
@@ -1111,43 +882,159 @@ def main():
         "translation": f"[[{source_name_en}]]",
         "tags": ["ingested", filename_base]
     }
-    src_body_id = f"# Ringkasan Sumber: {title_id}\n\n{summary_id}\n\n## Konsep Inti\n"
-    if concept_links_id:
-        src_body_id += "\n".join([f"- {link}" for link in concept_links_id])
+    if data.get("tags"):
+        src_fm_id["tags"] = data["tags"]
+
+    authors = data.get("authors") or ""
+    affiliation = data.get("affiliation") or ""
+    published = data.get("published") or ""
+    code = data.get("code") or ""
+
+    if data.get("custom_body_en"):
+        body_to_format = data["custom_body_en"]
+        split_pattern = r'^## (?:Related Work Connections|Koneksi Penelitian Terkait|Linked Entities|Entitas Terkait|Cross-References|Referensi Silang|Core Concepts|Konsep Inti)'
+        match = re.search(split_pattern, body_to_format, re.MULTILINE)
+        if match:
+            base_body_en = body_to_format[:match.start()].strip()
+        else:
+            base_body_en = body_to_format.strip()
     else:
-        src_body_id += "*Tidak ada konsep inti yang tertaut.*"
-        
+        metadata_header = f"# {title_en}\n\n"
+        if authors:
+            metadata_header += f"**Authors:** {authors}\n"
+        if affiliation:
+            metadata_header += f"**Affiliation:** {affiliation}\n"
+        if published:
+            metadata_header += f"**Published:** {published}\n"
+        if code:
+            metadata_header += f"**Code:** {code}\n"
+        base_body_en = f"{metadata_header}\n---\n\n{summary_en.strip()}"
+
+    linked_entities_section = "## Linked Entities\n\n"
+    if entity_links_en:
+        entity_bullets = []
+        for e in entities:
+            e_name = e.get("name")
+            if e_name:
+                entity_bullets.append(f"- [[{e_name}]]")
+        linked_entities_section += "\n".join(entity_bullets)
+    else:
+        linked_entities_section += "*No linked entities.*"
+
+    src_body_en = (
+        f"{base_body_en}\n\n"
+        f"---\n\n"
+        f"{core_concepts_section}\n\n"
+        f"{related_work_section}\n\n"
+        f"{linked_entities_section}"
+    )
+
+    write_wiki_page(source_path_en, src_fm_en, src_body_en)
+
+    if data.get("custom_body_id"):
+        body_to_format_id = data["custom_body_id"]
+        split_pattern = r'^## (?:Related Work Connections|Koneksi Penelitian Terkait|Linked Entities|Entitas Terkait|Cross-References|Referensi Silang|Core Concepts|Konsep Inti)'
+        match = re.search(split_pattern, body_to_format_id, re.MULTILINE)
+        if match:
+            base_body_id = body_to_format_id[:match.start()].strip()
+        else:
+            base_body_id = body_to_format_id.strip()
+    else:
+        metadata_header_id = f"# {title_id}\n\n"
+        if authors:
+            metadata_header_id += f"**Penulis:** {authors}\n"
+        if affiliation:
+            metadata_header_id += f"**Afiliasi:** {affiliation}\n"
+        if published:
+            metadata_header_id += f"**Publikasi:** {published}\n"
+        if code:
+            metadata_header_id += f"**Kode Sumber:** {code}\n"
+        base_body_id = f"{metadata_header_id}\n---\n\n{summary_id.strip()}"
+
+    linked_entities_section_id = "## Entitas Terkait\n\n"
+    if entity_links_id:
+        entity_bullets_id = []
+        for e in entities:
+            e_name = e.get("name")
+            if e_name:
+                target_id = resolve_translation_target(e_name, "id")
+                entity_bullets_id.append(f"- [[{target_id}]]")
+        linked_entities_section_id += "\n".join(entity_bullets_id)
+    else:
+        linked_entities_section_id += "*Tidak ada entitas terkait.*"
+
+    src_body_id = (
+        f"{base_body_id}\n\n"
+        f"---\n\n"
+        f"{core_concepts_section_id}\n\n"
+        f"{related_work_section_id}\n\n"
+        f"{linked_entities_section_id}\n\n"
+        f"---\n\n"
+        f"## Padanan Bahasa Inggris\n\n"
+        f"- [[{source_name_en}]] (Catatan Bahasa Inggris)"
+    )
+
     write_wiki_page(source_path_id, src_fm_id, src_body_id)
+
+
     
-    # 5. Scan vault and build normalization maps for both languages
     print("Scanning vault for wikilink normalization...")
-    vault_pages = scan_vault_pages()
+    vault_pages = scan_vault_pages_db()
     en_link_map = build_link_map(vault_pages, concepts, entities, "en")
     id_link_map = build_link_map(vault_pages, concepts, entities, "id")
     print(f"  Built EN link map ({len(en_link_map)} entries), ID link map ({len(id_link_map)} entries)")
     
-    # 6. Generate Parallel Concept Pages
+    # Print summary of detected relations
+    all_detected_relations = []  # Collect for source page summary
+    for c_name, rels in cross_refs.items():
+        if rels:
+            print(f"  Found {len(rels)} cross-reference(s) for concept '{c_name}'")
+            all_detected_relations.extend([(c_name, r) for r in rels])
+    
     for c in concepts:
-        c_name_en = c.get("name") or c.get("title_en", "").lower().replace(" ", "-")
-        c_name_id = f"{c_name_en}-id"
+        c_name_en = c.get("name")
+        c_name_id = resolve_translation_target(c_name_en, "id")
         
+        # Check if the concept already exists under any domain subfolder in the vault
+        existing_domain = find_existing_concept_domain(c_name_en, os.path.join(EN_DIR, "concepts"))
         c_domain = c.get("domain", "other").lower()
+        if existing_domain:
+            print(f"ℹ️ Found existing concept '{c_name_en}' in domain '{existing_domain}'. Overriding parsed domain '{c_domain}'.")
+            c_domain = existing_domain
+            c["domain"] = c_domain
+
         c_tags = c.get("tags", [])
-        
-        # Ensure 'ingest' tag exists
         if "ingest" not in c_tags:
             c_tags.append("ingest")
             
         c_path_en = os.path.join(EN_DIR, "concepts", c_domain, f"{c_name_en}.md")
         c_path_id = os.path.join(ID_DIR, "concepts", c_domain, f"{c_name_id}.md")
         
-        # Build See Also / Lihat Juga links (other concepts in this batch, excluding self)
         see_also_en = [f"- [[{x.get('name')}]]" for x in concepts if x.get('name') != c_name_en and x.get('name')]
-        see_also_id = [f"- [[{x.get('name')}-id]]" for x in concepts if x.get('name') != c_name_en and x.get('name')]
+        see_also_id = [f"- [[{resolve_translation_target(x.get('name'), 'id')}]]" for x in concepts if x.get('name') != c_name_en and x.get('name')]
         
-        # English Concept Page — normalize Title Case wikilinks to kebab-case
         c_content_en = c.get('content_en') or c.get('description_en') or ''
         normalized_content_en = normalize_wikilinks(c_content_en, en_link_map)
+        normalized_content_en = auto_link_media_and_tables(normalized_content_en, filename_base, "en")
+        
+        # Build relations for this concept
+        c_relations = cross_refs.get(c_name_en, []) + (c.get("relations", []) or [])
+        # Deduplicate by target+type
+        seen_rel = set()
+        unique_relations = []
+        for rel in c_relations:
+            rel_type = rel.get("type", "")
+            if rel_type in {"contrasting", "contrasts"}:
+                rel_type = "contradicts"
+                rel["type"] = "contradicts"
+            key = (rel.get("target", ""), rel_type)
+            if key not in seen_rel:
+                seen_rel.add(key)
+                # Ensure source citation is populated for every relation in the English run
+                if not rel.get("source"):
+                    rel["source"] = f"[[{source_name_en}]]"
+                unique_relations.append(rel)
+        
         c_fm_en = {
             "type": "concept",
             "domain": c_domain,
@@ -1161,17 +1048,68 @@ def main():
             "version": c.get("version") or "1.0.0",
             "status": c.get("status") or "active"
         }
-        see_also_en_section = f"\n\n## See Also\n\n{chr(10).join(see_also_en)}" if see_also_en else ""
-        c_body_en = f"# {c.get('title_en', c_name_en.replace('-', ' ').title())}\n\n{normalized_content_en}{see_also_en_section}\n\n## Sources\n\n- [[{source_name_en}]]"
+        # Only put relations to existing/new pages in frontmatter to satisfy the linter
+        valid_fm_relations = [r for r in unique_relations if r.get("target", "").lower() in valid_en_pages]
+        if valid_fm_relations:
+            c_fm_en["relations"] = valid_fm_relations
+        
+        # Build cross-references section for concept body
+        cross_ref_en = ""
+        if unique_relations:
+            supports = [r for r in unique_relations if r.get("type") == "supports"]
+            contradicts = [r for r in unique_relations if r.get("type") in {"contradicts", "contrasting"}]
+            extends = [r for r in unique_relations if r.get("type") == "extends"]
+            cross_ref_en = "\n\n## Cross-References\n"
+            for heading, items in [("Supports", supports), ("Contradicts", contradicts), ("Extends", extends)]:
+                if items:
+                    cross_ref_en += f"\n### {heading}\n\n"
+                    for r in items:
+                        claim = r.get("claim_en", "")
+                        source = r.get("source", f"[[{source_name_en}]]")
+                        target = r.get("target", "")
+                        if target.lower() in valid_en_pages:
+                            target_link = f"[[{target}]]"
+                        else:
+                            target_link = target.replace("-", " ").title()
+                        
+                        source_clean = source.replace("[[", "").replace("]]", "").strip()
+                        if source_clean.lower() in valid_en_pages:
+                            source_link = source
+                        else:
+                            source_link = extract_source_citation(source_clean)
+                            
+                        cross_ref_en += f"- **{target_link}**: {claim} \u2014 {source_link}\n"
+        
+        see_also_en_section = f"\n\n## See Also\n\n" + "\n".join(see_also_en) if see_also_en else ""
+        c_body_en = f"# {c.get('title_en', c_name_en.replace('-', ' ').title())}\n\n{normalized_content_en}{cross_ref_en}{see_also_en_section}\n\n## Sources\n\n- [[{source_name_en}]]"
         merge_or_write_page(c_path_en, c_fm_en, c_body_en)
         created_concepts.append(c_name_en)
         
-        # Indonesian Concept Page — normalize wikilinks to kebab-case-id
         c_title_id = sanitize_indonesian_latex(c.get('title_id') or c.get('title_en', c_name_en.replace('-', ' ').title()))
         c_content_id = sanitize_indonesian_latex(c.get('content_id') or c.get('description_id') or '')
         c_description_id = sanitize_indonesian_latex(c.get('description_id') or c.get('description_en', ''))
         
         normalized_content_id = normalize_wikilinks(c_content_id, id_link_map)
+        normalized_content_id = auto_link_media_and_tables(normalized_content_id, filename_base, "id")
+        
+        # Build ID relations (same relations, translated targets and localized sources)
+        id_relations = []
+        for rel in unique_relations:
+            id_rel = rel.copy()
+            target = rel.get("target", "")
+            id_rel["target"] = resolve_translation_target(target, "id")
+            
+            # Localize relation source citation to Indonesian source note version
+            id_source = rel.get("source", f"[[{source_name_en}]]")
+            source_clean = id_source.replace("[[", "").replace("]]", "").strip()
+            if source_clean.startswith("source-"):
+                source_id = resolve_translation_target(source_clean, "id")
+            else:
+                source_id = resolve_translation_target(f"source-{source_clean}", "id")
+            id_rel["source"] = f"[[{source_id}]]"
+            
+            id_relations.append(id_rel)
+        
         c_fm_id = {
             "type": "concept",
             "domain": c_domain,
@@ -1185,29 +1123,81 @@ def main():
             "version": c.get("version") or "1.0.0",
             "status": c.get("status") or "active"
         }
-        see_also_id_section = f"\n\n## Lihat Juga\n\n{chr(10).join(see_also_id)}" if see_also_id else ""
-        c_body_id = f"# {c_title_id}\n\n{normalized_content_id}{see_also_id_section}\n\n## Sumber\n\n- [[{source_name_id}]]"    
+        # Only put relations to existing/new pages in frontmatter to satisfy the linter
+        valid_fm_relations_id = [r for r in id_relations if r.get("target", "").lower() in valid_id_pages]
+        if valid_fm_relations_id:
+            c_fm_id["relations"] = valid_fm_relations_id
+        
+        # Build cross-references section for Indonesian concept body
+        cross_ref_id = ""
+        if id_relations:
+            supports_id = [r for r in id_relations if r.get("type") == "supports"]
+            contradicts_id = [r for r in id_relations if r.get("type") in {"contradicts", "contrasting"}]
+            extends_id = [r for r in id_relations if r.get("type") == "extends"]
+            cross_ref_id = "\n\n## Referensi Silang\n"
+            for heading, items in [("Mendukung", supports_id), ("Bertentangan", contradicts_id), ("Memperluas", extends_id)]:
+                if items:
+                    cross_ref_id += f"\n### {heading}\n\n"
+                    for r in items:
+                        claim = r.get("claim_id")
+                        if not claim:
+                            concept_name = r.get("concept_name")
+                            if concept_name:
+                                concept_name_id = resolve_translation_target(concept_name, "id")
+                                if concept_name_id in existing_concepts_id:
+                                    id_rels = existing_concepts_id[concept_name_id].get("relations", [])
+                                    target_id_clean = r.get("target", "")
+                                    for id_r in id_rels:
+                                        id_target_clean = id_r.get("target", "").replace("[[", "").replace("]]", "").strip()
+                                        if id_target_clean == target_id_clean and id_r.get("type") == rel_type:
+                                            claim = id_r.get("claim")
+                                            break
+                        if not claim:
+                            claim = r.get("claim_en") or r.get("claim", "")
+                            
+                        target_id = r.get("target", "")
+                        if target_id.lower() in valid_id_pages:
+                            target_link = f"[[{target_id}]]"
+                        else:
+                            target_link = target_id.replace("-", " ").title()
+                            
+                        source = r.get("source", f"[[{source_name_id}]]")
+                        source_clean = source.replace("[[", "").replace("]]", "").strip()
+                        if source_clean.lower() in valid_id_pages:
+                            source_link = source
+                        else:
+                            source_link = extract_source_citation(source_clean)
+                            
+                        cross_ref_id += f"- **{target_link}**: {claim} \u2014 {source_link}\n"
+        
+        see_also_id_section = f"\n\n## Lihat Juga\n\n" + "\n".join(see_also_id) if see_also_id else ""
+        c_body_id = f"# {c_title_id}\n\n{normalized_content_id}{cross_ref_id}{see_also_id_section}\n\n## Sumber\n\n- [[{source_name_id}]]"    
         merge_or_write_page(c_path_id, c_fm_id, c_body_id)
         
-    # 7. Generate Parallel Entity Pages
     for e in entities:
-        e_name_en = e.get("name") or e.get("title_en", "").lower().replace(" ", "-")
-        e_name_id = f"{e_name_en}-id"
+        e_name_en = e.get("name")
+        e_name_id = resolve_translation_target(e_name_en, "id")
         
+        # Check if the entity already exists under any domain subfolder in the vault
+        existing_domain = find_existing_concept_domain(e_name_en, os.path.join(EN_DIR, "entities"))
         e_domain = e.get("domain", "other").lower()
+        if existing_domain:
+            print(f"ℹ️ Found existing entity '{e_name_en}' in domain '{existing_domain}'. Overriding parsed domain '{e_domain}'.")
+            e_domain = existing_domain
+            e["domain"] = e_domain
+
         e_category = e.get("category", "other").lower()
         e_tags = e.get("tags", [])
         
         e_path_en = os.path.join(EN_DIR, "entities", e_domain, f"{e_name_en}.md")
         e_path_id = os.path.join(ID_DIR, "entities", e_domain, f"{e_name_id}.md")
         
-        # Build Related Entities / Entitas Terkait links (other entities in this batch, excluding self)
         related_en = [f"- [[{x.get('name')}]]" for x in entities if x.get('name') != e_name_en and x.get('name')]
-        related_id = [f"- [[{x.get('name')}-id]]" for x in entities if x.get('name') != e_name_en and x.get('name')]
+        related_id = [f"- [[{resolve_translation_target(x.get('name'), 'id')}]]" for x in entities if x.get('name') != e_name_en and x.get('name')]
         
-        # English Entity Page — normalize Title Case wikilinks to kebab-case
         e_content_en = e.get('content_en') or e.get('description_en') or ''
         normalized_content_en = normalize_wikilinks(e_content_en, en_link_map)
+        normalized_content_en = auto_link_media_and_tables(normalized_content_en, filename_base, "en")
         e_fm_en = {
             "type": "entity",
             "category": e_category,
@@ -1221,16 +1211,16 @@ def main():
             "version": e.get("version") or "1.0.0",
             "status": e.get("status") or "active"
         }
-        related_en_section = f"\n\n## Related Entities\n\n{chr(10).join(related_en)}" if related_en else ""
+        related_en_section = f"\n\n## Related Entities\n\n" + "\n".join(related_en) if related_en else ""
         e_body_en = f"# {e.get('title_en', e_name_en.replace('-', ' ').title())}\n\n{normalized_content_en}{related_en_section}\n\n## Sources\n\n- [[{source_name_en}]]"
         merge_or_write_page(e_path_en, e_fm_en, e_body_en)
         created_entities.append(e_name_en)
         
-        # Indonesian Entity Page — normalize wikilinks to kebab-case-id
         e_title_id = sanitize_indonesian_latex(e.get('title_id') or e.get('title_en', e_name_en.replace('-', ' ').title()))
         e_content_id = sanitize_indonesian_latex(e.get('content_id') or e.get('description_id') or '')
         
         normalized_content_id = normalize_wikilinks(e_content_id, id_link_map)
+        normalized_content_id = auto_link_media_and_tables(normalized_content_id, filename_base, "id")
         e_fm_id = {
             "type": "entity",
             "category": e_category,
@@ -1244,11 +1234,10 @@ def main():
             "version": e.get("version") or "1.0.0",
             "status": e.get("status") or "active"
         }
-        related_id_section = f"\n\n## Entitas Terkait\n\n{chr(10).join(related_id)}" if related_id else ""
+        related_id_section = f"\n\n## Entitas Terkait\n\n" + "\n".join(related_id) if related_id else ""
         e_body_id = f"# {e_title_id}\n\n{normalized_content_id}{related_id_section}\n\n## Sumber\n\n- [[{source_name_id}]]"
         merge_or_write_page(e_path_id, e_fm_id, e_body_id)
         
-    # 8. Append Chronological Log
     log_line = f"## [{current_date}] INGEST | {os.path.basename(raw_path)} | Created source page `{source_name_en}.md`. "
     if created_concepts:
         log_line += f"Created {len(created_concepts)} concept pages: {', '.join(created_concepts)}. "
@@ -1257,21 +1246,61 @@ def main():
     log_line += "All wikilinks integrated (cross-language links sanitized)."
     
     try:
-        with open(LOG_PATH, "a", encoding="utf-8") as lf:
-            lf.write("\n" + log_line + "\n")
+        existing_log = ""
+        if os.path.exists(LOG_PATH):
+            with open(LOG_PATH, "r", encoding="utf-8") as lf:
+                existing_log = lf.read()
+        
+        header_text = (
+            "# Chronicle Log\n\n"
+            "This is a chronological log of all operations (ingestion, queries, lint passes) "
+            "performed on this personal LLM Wiki, with the latest entries at the top.\n\n"
+            "---"
+        )
+        
+        body_entries = []
+        if existing_log:
+            parts = existing_log.split("---")
+            if len(parts) >= 2:
+                body = "---".join(parts[1:]).strip()
+                current_entry = []
+                for line in body.split("\n"):
+                    if line.strip().startswith("## ["):
+                        if current_entry:
+                            body_entries.append("\n".join(current_entry).strip())
+                        current_entry = [line]
+                    else:
+                        if current_entry:
+                            current_entry.append(line)
+                if current_entry:
+                    body_entries.append("\n".join(current_entry).strip())
+                
+        new_entry = log_line.strip()
+        all_entries = [new_entry] + body_entries
+        
+        new_log_content = header_text + "\n\n" + "\n\n".join(all_entries) + "\n"
+        with open(LOG_PATH, "w", encoding="utf-8") as lf:
+            lf.write(new_log_content)
         print(f"Logged operation to {LOG_PATH}")
     except Exception as e:
         print(f"Warning: Failed to write to chronicle log: {e}")
         
-    # 9. Re-Index the vault
     print("Auto-triggering wiki re-indexing pass...")
     try:
+        import subprocess
         subprocess.run([sys.executable, "scripts/make_index.py"], check=True)
         print("Re-indexing completed successfully!")
     except Exception as e:
         print(f"Warning: Failed to run make_index.py: {e}")
         
+    # Run duplicate cleanup safeguard to prevent Obsidian link resolution conflicts
+    try:
+        cleanup_duplicate_empty_files()
+    except Exception as e:
+        print(f"Warning: Failed to run cleanup safeguard: {e}")
+        
     print("\n🎉 Ingestion workflow finished successfully! 🎉")
+
 
 if __name__ == "__main__":
     main()

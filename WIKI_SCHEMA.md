@@ -7,7 +7,7 @@ This configuration file defines the bilingual parallel directory structure, meta
 ## 1. Directory Structure
 
 - `raw/`: Immutable raw source materials. Do NOT modify files in this directory.
-  - `raw/papers/`: PDF research papers, textbooks, and technical journals.
+  - `raw/papers/`: PDF research papers, textbooks, and technical journals. Separated into domain subfolders (e.g., `raw/papers/ai-ml/`, `raw/papers/finance/`, `raw/papers/personal-development/`).
   - `raw/articles/`: Web clips, blog posts, news, and markdown clippings.
   - `raw/notes/`: Personal raw thoughts, logs, and transcriptions.
 - `wiki/`: Persistent compiled AI-managed Markdown Wiki.
@@ -15,13 +15,13 @@ This configuration file defines the bilingual parallel directory structure, meta
   - `wiki/en/`: === English Sub-Wiki ===
     - `wiki/en/index.md`: Auto-generated English visual index catalog.
     - `wiki/en/sources/`: Detailed summaries of sources written in English.
-    - `wiki/en/concepts/`: concepts/finance/, concepts/software-engineering/, concepts/ai/, concepts/economics/
-    - `wiki/en/entities/`: entities/finance/, entities/software-engineering/, entities/ai/, entities/economics/
+    - `wiki/en/concepts/`: concepts/finance/, concepts/software-engineering/, concepts/ai/, concepts/economics/, concepts/education/, concepts/personal-development/, concepts/mathematics/, concepts/language-learning/
+    - `wiki/en/entities/`: entities/finance/, entities/software-engineering/, entities/ai/, entities/economics/, entities/education/, entities/personal-development/, entities/mathematics/, entities/language-learning/
   - `wiki/id/`: === Indonesian Sub-Wiki ===
     - `wiki/id/index.md`: Auto-generated Indonesian visual index catalog.
     - `wiki/id/sources/`: Detailed summaries of sources written in Indonesian.
-    - `wiki/id/concepts/`: concepts/finance/, concepts/software-engineering/, concepts/ai/, concepts/economics/
-    - `wiki/id/entities/`: entities/finance/, entities/software-engineering/, entities/ai/, entities/economics/
+    - `wiki/id/concepts/`: concepts/finance/, concepts/software-engineering/, concepts/ai/, concepts/economics/, concepts/education/, concepts/personal-development/, concepts/mathematics/, concepts/language-learning/
+    - `wiki/id/entities/`: entities/finance/, entities/software-engineering/, entities/ai/, entities/economics/, entities/education/, entities/personal-development/, entities/mathematics/, entities/language-learning/
 - `scripts/`: Pure local Python scripts for indexing, linting, search, and fallbacks.
 
 ---
@@ -34,7 +34,7 @@ Every `.md` file created or updated in the `wiki/en/` or `wiki/id/` directories 
 ```yaml
 ---
 type: concept
-domain: ai        # Options: finance, software-engineering, ai, economics
+domain: ai        # Options: finance, software-engineering, ai, economics, education, personal-development, mathematics, language-learning
 lang: en          # Options: en, id
 translation: "[[translated_page_name]]" # Link to parallel version in other language
 tags: [tag1, tag2]
@@ -42,6 +42,11 @@ created: YYYY-MM-DD
 updated: YYYY-MM-DD
 sources: ["[[source-page-name]]"]
 description: A short 1-2 sentence definition of the concept.
+relations:        # Optional. Auto-detected cross-references to other concepts.
+  - target: "[[other-concept-name]]"
+    type: supports | contradicts | contrasting | extends
+    source: "[[source-page-name]]"
+    claim: "Brief description of the specific claim"
 ---
 ```
 
@@ -50,13 +55,18 @@ description: A short 1-2 sentence definition of the concept.
 ---
 type: entity
 category: person  # Options: person, organization, book, software, model, tool
-domain: ai        # Options: finance, software-engineering, ai, economics
+domain: ai        # Options: finance, software-engineering, ai, economics, education, personal-development, mathematics, language-learning
 lang: en          # Options: en, id
 translation: "[[translated_page_name]]" # Link to parallel version in other language
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
 sources: ["[[source-page-name]]"]
 tags: [tag1, tag2]
+relations:        # Optional. Auto-detected cross-references.
+  - target: "[[other-entity-name]]"
+    type: supports | contradicts | contrasting | extends
+    source: "[[source-page-name]]"
+    claim: "Brief description of the specific claim"
 ---
 ```
 
@@ -91,27 +101,47 @@ Triggered when a new source is added to `raw/`.
     - Identify core **Entities**. Write or update parallel entities in both languages under `wiki/en/entities/` and `wiki/id/entities/`, linking them together.
 4.  **Audit Logging**: Append a log entry to `wiki/log.md`:
     `## [YYYY-MM-DD] INGEST | <filename> | Compiled parallel English and Indonesian notes.`
-5.  **Re-Index**: Execute `python scripts/make_index.py` locally to automatically compile both localized index files: `wiki/en/index.md` and `wiki/id/index.md`.
+5.  **Re-Index**: Execute `rtk python scripts/make_index.py` locally to automatically compile both localized index files: `wiki/en/index.md` and `wiki/id/index.md`.
 
-### 3.2. Localized Query Protocol (`/query <question>`)
-1.  **Detect query language**: Determine if the query is in English or Indonesian.
-2.  **Retrieve Content**: Execute `python scripts/search.py "<query>"` to locate matching pages in the target language vault.
-3.  **Formulate cited answer**: Synthesize the final answer in the query language, placing explicit wikilinks (e.g. `[[Arsitektur Transformer]]` or `[[Transformer Architecture]]`) at points of assertion.
+### 3.2. Localized Query & Conversational Chat Protocol (`/query <question>` or `--chat "<question>"`)
+1.  **Standard Query Mode**:
+    - Execute `rtk python scripts/search.py "<query>"` to locate matching pages in the target language vault.
+    - Synthesize or retrieve matching pages with relevance scores and snippets.
+2.  **Conversational RAG Chat Mode**:
+    - Execute `rtk python scripts/search.py --chat "<question>"` to launch the RAG chat protocol. If no question is supplied, enters an interactive chat loop.
+    - **Keyword Extraction**: Automatically filters out common English/Indonesian question stopwords (e.g., *what*, *how*, *apa*, *itu*, *bagaimana*) using a local heuristic stopword list to construct optimal keyword search queries.
+    - **Context Retrieval**: Performs a search on the extracted keywords to find the most relevant source documents in the SQLite FTS5 database (or falls back to a linear scan).
+    - **DeepSeek Integration**: Feeds the top 5 document contents as context to the DeepSeek API (`deepseek-chat`). If the API key is missing or in mock mode (`MOCK_DEEPSEEK=1`), simulates the response.
+    - **Preservation of Terms**: Ensures the generated answer grounds itself in the provided context, matches the user's queried language, and strictly preserves scientific terms (e.g., *In-Context Learning*, *Softmax*) and LaTeX mathematical notations natively.
 
 ### 3.3. Bilingual Lint Protocol (`/lint`)
 Verify the structural integrity of both vaults.
-1.  **Execute Local Linter**: Run `python scripts/linter.py`.
+1.  **Execute Local Linter**: Run `rtk python scripts/linter.py`.
 2.  **Verify Translation Links**: The linter will ensure that translation target links are reciprocal (e.g. if Page A links to Page B as its translation, Page B must exist and link back to Page A).
 
 ---
 
-## 4. Factual Contradiction Resolution Heuristics
+## 4. Cross-Reference & Contradiction Resolution
 
-When a new source directly contradicts facts or data recorded on an existing wiki page:
-1.  **No Silent Overwrites**: Do NOT replace the old fact or statistics silently.
+The ingestion pipeline automatically detects and surfaces relationships between concepts from different sources.
+
+### 4.1. Relation Types
+- **`supports`**: New source provides evidence that reinforces an existing concept's claims.
+- **`contradicts`**: New source presents findings that conflict with an existing concept.
+- **`contrasting`**: New source presents findings that contrast, differ from, or offer an alternative perspective to an existing concept (mapped to `contradicts` / `bertentangan` groups).
+- **`extends`**: New source builds upon, refines, or generalizes an existing concept.
+
+### 4.2. Rendering Rules
+1.  **No Silent Overwrites**: Do NOT replace old facts or statistics silently.
 2.  **No Averaging**: Do NOT merge mathematical figures.
-3.  **Bilingual Attribution Blocks**: Introduce matching visible `## Factual Conflicts & Debate` / `## Konflik Fakta & Debat` sections on the target pages in both languages, showing the claims side-by-side with source attribution and date.
-4.  **Conflict Escalation**: Stop and prompt the user during the active session for human-in-the-loop review.
+3.  **Bilingual Cross-Reference Sections**: Every concept/entity page with detected relations MUST have a `## Cross-References` (EN) / `## Referensi Silang` (ID) section, grouped by relation type:
+    - `### Supports` / `### Mendukung`
+    - `### Contradicts` / `### Bertentangan` (includes both `contradicts` and `contrasting` relations)
+    - `### Extends` / `### Memperluas`
+4.  **Source Attribution**: Each relation entry must cite the source paper via wikilink.
+5.  **Conflict Escalation**: When `contradicts` relations are detected, log a warning and prompt the user during the active session for human-in-the-loop review.
+6.  **Source Page Summary**: Each source page includes a `## Cross-References` table summarizing all relations detected from that paper.
+7.  **Frontmatter Storage**: Relations are stored in the `relations:` frontmatter field for programmatic access.
 
 ---
 
