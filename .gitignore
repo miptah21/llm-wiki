@@ -77,3 +77,8 @@ wiki/log.md
 
 # Fallback block for PDF files
 *.pdf
+
+# User requested ignores
+.agents/
+docs/
+.superpowers/brainstorm/session-1/
