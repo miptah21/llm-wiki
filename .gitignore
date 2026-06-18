@@ -68,12 +68,12 @@ raw/notes/*
 raw/papers/*
 !raw/papers/.gitkeep
 
+# Compiled wiki directories and logs (ignores personal notes while keeping template files intact)
+wiki/en/
+wiki/id/
+wiki/raw_sources/
+wiki/assets/
+wiki/log.md
+
 # Fallback block for PDF files
 *.pdf
-
-# Compiled wiki directories and logs (ignores personal notes while keeping template files intact)
-wiki/en/**
-wiki/id/**
-wiki/raw_sources/**
-wiki/assets/**
-wiki/log.md
